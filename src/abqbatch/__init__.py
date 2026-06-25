@@ -1,0 +1,5 @@
+"""Batch Abaqus INP generation, execution, resume, and postprocessing."""
+
+__all__ = ["__version__"]
+
+__version__ = "0.1.0"

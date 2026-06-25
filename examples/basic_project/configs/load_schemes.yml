@@ -1,0 +1,35 @@
+loads:
+  disp_ramp_y:
+    type: displacement_control
+    step: Step-1
+    target_set: RP_LOAD
+    dof: 2
+    value: -1.0
+    amplitude:
+      name: Amp-Ramp
+      data:
+        - [0.0, 0.0]
+        - [1.0, 1.0]
+
+  force_ramp_y:
+    type: force_control
+    step: Step-1
+    target_set: RP_LOAD
+    dof: 2
+    value: -1000.0
+    amplitude:
+      name: Amp-Ramp
+      data:
+        - [0.0, 0.0]
+        - [1.0, 1.0]
+
+  pressure_ramp:
+    type: pressure
+    step: Step-1
+    surface: SURF_LOAD
+    value: 5.0
+    amplitude:
+      name: Amp-Ramp
+      data:
+        - [0.0, 0.0]
+        - [1.0, 1.0]

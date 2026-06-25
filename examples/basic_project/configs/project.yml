@@ -1,0 +1,27 @@
+project:
+  name: basic_project
+
+abaqus:
+  command: abaqus
+  cpus: 8
+  memory: 90%
+  scratch: work/scratch
+  interactive: true
+
+runner:
+  max_parallel: 1
+  timeout_seconds: null
+  stop_on_failure: false
+  continue_after_failure: true
+  retry_failed: false
+
+paths:
+  raw_inp: raw_inp
+  work: work
+  reports: reports
+  database: db/state.sqlite
+
+generation:
+  patch_mode: anchor_then_block
+  add_restart_write: true
+  add_standard_output: true

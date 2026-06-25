@@ -1,0 +1,20 @@
+materials:
+  steel_E210GPa:
+    model: elastic
+    name: Steel
+    density: 7.85e-9
+    elastic:
+      E: 210000.0
+      nu: 0.30
+
+  steel_plastic_A:
+    model: elastic_plastic
+    name: Steel
+    density: 7.85e-9
+    elastic:
+      E: 210000.0
+      nu: 0.30
+    plastic:
+      - [250.0, 0.0000]
+      - [300.0, 0.0100]
+      - [350.0, 0.0300]

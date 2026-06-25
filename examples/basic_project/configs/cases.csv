@@ -1,0 +1,3 @@
+case_id,source_inp,material_profile,load_profile,post_profile,cpus,memory,priority
+C000001,raw_inp/model_001.inp,steel_E210GPa,disp_ramp_y,default,8,90%,10
+C000002,raw_inp/model_002.inp,steel_plastic_A,force_ramp_y,default,8,90%,20

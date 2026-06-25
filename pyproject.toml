@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "abqbatch"
+version = "0.1.0"
+description = "Batch Abaqus INP generation, execution, resume, restart, and postprocessing pipeline"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "abqbatch contributors" }]
+dependencies = [
+  "typer>=0.12",
+  "pyyaml>=6.0",
+  "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.5",
+  "mypy>=1.0",
+]
+
+[project.scripts]
+abqbatch = "abqbatch.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = [
+  ".tmp",
+  "tmp",
+  "test_runs",
+  "pytest-cache-files-*",
+  "13-inp",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/abqbatch/cli.py" = ["B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -p no:cacheprovider"
