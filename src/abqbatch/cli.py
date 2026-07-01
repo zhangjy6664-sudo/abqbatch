@@ -17,6 +17,7 @@ from abqbatch.hashes import sha256_file
 from abqbatch.inventory import inventory_project
 from abqbatch.logging_utils import setup_logging
 from abqbatch.meso_compression import app as meso_compression_app
+from abqbatch.meso_shear import app as meso_shear_app
 from abqbatch.report import generate_reports
 from abqbatch.restart import (
     build_explicit_recover_command,
@@ -29,7 +30,7 @@ from abqbatch.validators import validate_project
 
 app = typer.Typer(help="Batch Abaqus INP generation and execution pipeline.")
 app.add_typer(meso_compression_app, name="meso-compression")
-
+app.add_typer(meso_shear_app, name="meso-shear")
 
 @app.command("init")
 def init_command(
@@ -224,5 +225,3 @@ def _record_aux_command(cfg, case_id: str, attempt_type: str, command: AbaqusCom
     db.add_artifact(
         cfg.db_path, case_id, attempt_id, "command", command_path, sha256_file(command_path)
     )
-
-

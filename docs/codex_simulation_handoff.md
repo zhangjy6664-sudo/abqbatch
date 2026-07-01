@@ -1,14 +1,15 @@
 # Codex Simulation Handoff
 
-This document is for the Codex instance on another Windows workstation that will take over the Abaqus meso compression simulations.
+This document is for the Codex instance on another Windows workstation that will take over or audit the Abaqus meso compression and shear simulations.
 
-Last updated: 2026-06-29, Asia/Shanghai.
+Last updated: 2026-07-01, Asia/Shanghai.
 
 ## Current Repository State
 
 - Repository: `https://github.com/zhangjy6664-sudo/abqbatch.git`
 - Working branch to continue from: `codex/meso-compression-batch-pipeline`
 - Latest relevant commits:
+  - `Add meso shear batch workflow`
   - `9735c6b Add original meso inp decks`
   - `3df3ca0 Add meso compression batch pipeline`
 - The raw source decks are committed through Git LFS:
@@ -213,6 +214,75 @@ Count moved: `746`. Size moved: about `12.541 GB`.
 
 If a previous run's `working.inp`, raw copy, DAT, or MSG is needed for audit, restore it by searching the archive index by `original_path`, `run`, or `case_id`. The D: `runs` directory intentionally no longer contains those large historical files.
 
+## Completed Meso Shear Batch On The Original Machine
+
+Selected shear parameter JSON:
+
+```text
+D:\ZDYF_NBY\13-24-24-JQ-simulation\07_validation\final_selected_parameters\13_24_24_jq_shear_selected_hashin_vf053_beta2p2_pa1_0.json
+```
+
+Pipeline command group: `abqbatch meso-shear`.
+
+Final status after the 2026-07-01 run:
+
+```text
+13-inp / jq_shear_hashin_vf053_beta2p2_pa1_0_35inp: SOLVED=35
+132    / jq_shear_hashin_vf053_beta2p2_pa1_0_132:   SOLVED=35, DATACHECK_FAILED=1
+qj     / jq_shear_hashin_vf053_beta2p2_pa1_0_qj:    SOLVED=36
+```
+
+The only shear datacheck failure is `132-48-72`; it did not enter analysis. Its failed datacheck outputs are archived and indexed.
+
+Shear report workbooks on D:
+
+```text
+D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_35inp\reports\meso_shear_summary.xlsx
+D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_132\reports\meso_shear_summary.xlsx
+D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_qj\reports\meso_shear_summary.xlsx
+D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_all\reports\meso_shear_summary_all.xlsx
+```
+
+Shear archive indexes on D:
+
+```text
+D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_35inp\reports\archive_index.csv
+D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_132\reports\archive_index.csv
+D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_qj\reports\archive_index.csv
+D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_all\reports\archive_index_all.csv
+```
+
+Archived shear output root on E:
+
+```text
+E:\ZDYF_NBY_abqbatch_archive\jq_shear_hashin_vf053_beta2p2_pa1_0
+```
+
+Archive index row counts:
+
+```text
+35inp: 525
+132:   528
+qj:    540
+all:   1593
+```
+
+The D: shear work directories retain `manifest.json`, `state.json`, validation files, command logs, summary JSON, curve CSV, original inp copies, and working inp copies. Top-level Abaqus output classes such as `.odb`, `.stt`, `.sim`, `.mdl`, `.prt`, `.dat`, `.msg`, `.com`, `.023`, `.sta`, and `.log` were copied to E:, SHA256-verified, and removed from D:.
+
+To prepare a new shear batch on another machine, use the same selected JSON and raw deck directory:
+
+```powershell
+abqbatch meso-shear prepare `
+  --selected-json "D:\ZDYF_NBY\13-24-24-JQ-simulation\07_validation\final_selected_parameters\13_24_24_jq_shear_selected_hashin_vf053_beta2p2_pa1_0.json" `
+  --input-dir "D:\ZDYF_NBY\abqbatch\qj" `
+  --run-dir "D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_qj_retry_01"
+
+abqbatch meso-shear smoke --run-dir "D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_qj_retry_01" --case QJ-12-12
+abqbatch meso-shear datacheck --run-dir "D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_qj_retry_01"
+abqbatch meso-shear run --run-dir "D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_qj_retry_01"
+abqbatch meso-shear report-xlsx --run-dir "D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_qj_retry_01"
+```
+
 ## Recommended Recovery Strategy For Old Failures
 
 Do not rerun old failed cases directly inside the archived historical run directories unless the needed `input/*.inp` files have been restored from E:.
@@ -257,24 +327,21 @@ print(write_results_xlsx(run_dir))
 
 ## Disk Hygiene During Long Runs
 
-After a chunk is complete and no Abaqus process is active, it is safe to remove generated heavy intermediates under `runs/` while preserving DAT/summary/state if needed:
+Do not delete large Abaqus outputs as a cleanup strategy. The current rule is:
+
+1. Extract DAT curves and write `summary.json` / curve CSV first.
+2. Copy heavy outputs to E: under the configured archive root.
+3. Verify SHA256 for the copied file.
+4. Remove the D: source only after verification succeeds.
+5. Write `archive_index.csv` and `archive_index.json` in the run's `reports/` directory.
+
+The shear pipeline does this automatically after each analysis case and after a failed datacheck case. Manual backfill uses the same verified archive path:
 
 ```powershell
-$root = (Resolve-Path 'D:\ZDYF_NBY\abqbatch\runs').Path
-$allowed = @('.odb','.stt','.sim','.mdl','.prt','.023')
-$files = Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
-  Where-Object { $allowed -contains $_.Extension.ToLowerInvariant() }
-
-foreach ($file in $files) {
-  $full = $file.FullName
-  if (-not $full.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
-    throw "Refusing outside root: $full"
-  }
-  Remove-Item -LiteralPath $full -Force
-}
+abqbatch meso-shear archive-heavy --run-dir "D:\ZDYF_NBY\abqbatch\runs\<run_dir>"
 ```
 
-Do not delete `state.json`, `manifest.json`, `summary.json`, curve CSVs, or report workbooks unless the run is intentionally discarded.
+Do not remove `state.json`, `manifest.json`, `validation.json`, `summary.json`, curve CSVs, original/working inp copies under `input/`, command logs, archive indexes, or report workbooks unless the run is intentionally discarded.
 
 ## Minimum Handoff Checklist
 
@@ -287,4 +354,3 @@ Before the new Codex submits any Abaqus job:
 - No stale `.lck` files exist in the target run directory.
 - No `standard.exe` or `explicit.exe` process is already running.
 - The next run directory name is new and does not overwrite a completed run.
-
