@@ -223,6 +223,30 @@ def test_archive_case_outputs_copies_verifies_and_indexes(workspace_tmp: Path) -
     assert Path(payload["index_json"]).exists()
 
 
+
+def test_archive_case_outputs_keeps_collision_versions(workspace_tmp: Path) -> None:
+    case_dir = workspace_tmp / "run" / "work" / "cases" / "13-12-24"
+    case_dir.mkdir(parents=True)
+    source = case_dir / "same.dat"
+    source.write_text("new dat\n", encoding="utf-8")
+    archive_case_dir = workspace_tmp / "archive" / "run" / "13-12-24"
+    archive_case_dir.mkdir(parents=True)
+    existing = archive_case_dir / "same.dat"
+    existing.write_text("old dat\n", encoding="utf-8")
+    manifest = {
+        "run_dir": str(workspace_tmp / "run"),
+        "settings": {"archive_root": str(workspace_tmp / "archive")},
+    }
+    case = {"case_id": "13-12-24", "case_dir": str(case_dir), "job_name": "ms_13"}
+
+    payload = archive_case_outputs(manifest, case, reason="unit_test", remove_source=False)
+
+    assert payload["archived_count"] == 1
+    archived = Path(payload["files"][0]["archive_path"])
+    assert archived.exists()
+    assert archived.name != "same.dat"
+    assert existing.read_text(encoding="utf-8") == "old dat\n"
+
 def test_evaluate_shear_curve_keeps_failed_partial_metrics() -> None:
     metrics = evaluate_shear_curve(
         [(0.01, 20.0), (0.04, 55.0)],

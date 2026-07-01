@@ -518,6 +518,19 @@ def _heavy_output_files(case_dir: Path) -> list[Path]:
     return sorted(set(files), key=lambda item: item.name.lower())
 
 
+
+def _collision_archive_path(dest: Path, source_hash: str) -> Path:
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    for index in range(1, 1000):
+        if index == 1:
+            suffix = f".{stamp}_{source_hash[:8]}"
+        else:
+            suffix = f".{stamp}_{source_hash[:8]}_{index:03d}"
+        candidate = dest.with_name(f"{dest.stem}{suffix}{dest.suffix}")
+        if not candidate.exists() or sha256_file(candidate) == source_hash:
+            return candidate
+    raise RuntimeError(f"Could not allocate archive collision path for {dest}")
+
 def archive_case_outputs(
     manifest: dict[str, Any],
     case: dict[str, Any],
@@ -541,6 +554,8 @@ def archive_case_outputs(
         source_hash = sha256_file(source)
         size = source.stat().st_size
         dest = archive_case_dir / source.name
+        if dest.exists() and sha256_file(dest) != source_hash:
+            dest = _collision_archive_path(dest, source_hash)
         if dest.exists():
             dest_hash = sha256_file(dest)
             if dest_hash != source_hash:

@@ -224,15 +224,16 @@ D:\ZDYF_NBY\13-24-24-JQ-simulation\07_validation\final_selected_parameters\13_24
 
 Pipeline command group: `abqbatch meso-shear`.
 
-Final status after the 2026-07-01 run:
+Final status after the 2026-07-01 repair run:
 
 ```text
 13-inp / jq_shear_hashin_vf053_beta2p2_pa1_0_35inp: SOLVED=35
-132    / jq_shear_hashin_vf053_beta2p2_pa1_0_132:   SOLVED=35, DATACHECK_FAILED=1
+132    / jq_shear_hashin_vf053_beta2p2_pa1_0_132:   SOLVED=36
 qj     / jq_shear_hashin_vf053_beta2p2_pa1_0_qj:    SOLVED=36
+all:                                                SOLVED=107
 ```
 
-The only shear datacheck failure is `132-48-72`; it did not enter analysis. Its failed datacheck outputs are archived and indexed.
+`132-48-72` was repaired after the initial datacheck failure. The broken 132 raw deck was missing the closing part/assembly structure, so that case now uses the complete JQ deck copy at `D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_132\repair_sources\132-48-72-jq.inp`; the generated `working.inp` patches `"Constraints Driver Shear_yx", 1, 1, 0.0800000000`. It passed datacheck and solved. Final metrics: 123 curve points, shear modulus 1.9558455805912422 GPa, stress at 0.05 strain 70.52457266858343 MPa, peak within 0.05 strain 70.20779992495136 MPa at strain 0.0496.
 
 Shear report workbooks on D:
 
@@ -262,9 +263,9 @@ Archive index row counts:
 
 ```text
 35inp: 525
-132:   528
+132:   533
 qj:    540
-all:   1593
+all:   1598
 ```
 
 The D: shear work directories retain `manifest.json`, `state.json`, validation files, command logs, summary JSON, curve CSV, original inp copies, and working inp copies. Top-level Abaqus output classes such as `.odb`, `.stt`, `.sim`, `.mdl`, `.prt`, `.dat`, `.msg`, `.com`, `.023`, `.sta`, and `.log` were copied to E:, SHA256-verified, and removed from D:.
@@ -335,7 +336,7 @@ Do not delete large Abaqus outputs as a cleanup strategy. The current rule is:
 4. Remove the D: source only after verification succeeds.
 5. Write `archive_index.csv` and `archive_index.json` in the run's `reports/` directory.
 
-The shear pipeline does this automatically after each analysis case and after a failed datacheck case. Manual backfill uses the same verified archive path:
+The shear pipeline does this automatically after each analysis case and after a failed datacheck case. If a rerun produces a different file with an already archived name, the existing E: file is preserved and the new file is archived with a timestamp/hash suffix. Manual backfill uses the same verified archive path:
 
 ```powershell
 abqbatch meso-shear archive-heavy --run-dir "D:\ZDYF_NBY\abqbatch\runs\<run_dir>"
