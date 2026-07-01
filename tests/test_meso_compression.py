@@ -307,7 +307,7 @@ def test_interpolator_rejects_target_only_records() -> None:
         select_strength_candidate(target, [target])
 
 
-def test_out_of_bounds_reference_does_not_accept_case() -> None:
+def test_out_of_bounds_reference_can_accept_case() -> None:
     target = {
         "data_role": TARGET_ONLY,
         "case_id": "13-12-24",
@@ -327,8 +327,10 @@ def test_out_of_bounds_reference_does_not_accept_case() -> None:
 
     decision = select_strength_candidate(target, sim_records)
 
-    assert decision["status"] == "planned"
-    assert decision["angle_deg"] >= 1.0
+    assert decision["status"] == "accepted"
+    assert decision["accepted_source_role"] == REFERENCE_SIM
+    assert decision["accepted_angle_deg"] == 0.8
+    assert decision["accepted_g1c"] == 5.0
 
 
 def test_strength_candidate_uses_simulation_bracket() -> None:
@@ -547,7 +549,9 @@ def test_run_calibration_batch_updates_history_and_archives(
     assert result["history_rows"][0]["error_pct"] == 7.5
     assert result["history_rows"][0]["accepted"] is True
     assert archive_calls[0]["batch_id"] == "batch_001"
-    assert archive_calls[0]["attempt_rows"][0]["job_name"].startswith("mc_13_12_24_cal_a2")
+    archived_jobs = {row["job_name"] for row in archive_calls[0]["attempt_rows"]}
+    assert any(job.startswith("mc_13_12_24_cal_a2") for job in archived_jobs)
+    assert any(job.endswith("_dc") for job in archived_jobs)
     with history_csv.open("r", encoding="utf-8", newline="") as stream:
         rows = list(csv.DictReader(stream))
     assert rows[0]["data_role"] == CURRENT_SIM

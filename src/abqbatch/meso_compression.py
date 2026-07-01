@@ -1792,12 +1792,6 @@ def _sampled(records: list[dict[str, Any]], angle_deg: float, g1c: float) -> boo
     )
 
 
-def _within_calibration_bounds(record: dict[str, Any]) -> bool:
-    angle = float(record["angle_deg"])
-    g1c = float(record["g1c"])
-    return ANGLE_MIN_DEG <= angle <= ANGLE_MAX_DEG and G1C_MIN <= g1c <= G1C_MAX
-
-
 def _brackets(target_strength: float, left: float, right: float) -> bool:
     return min(left, right) <= target_strength <= max(left, right) and abs(left - right) > 1e-9
 
@@ -1907,7 +1901,7 @@ def select_strength_candidate(
             target_strength_mpa=target_strength,
             simulated_strength_mpa=float(record["compressive_strength_mpa"]),
         )
-        if error <= acceptance_error_pct and _within_calibration_bounds(record):
+        if error <= acceptance_error_pct:
             accepted_records.append((error, record))
     if accepted_records:
         error, record = min(accepted_records, key=lambda item: item[0])
@@ -2283,16 +2277,18 @@ def run_calibration_batch(
         row["datacheck_status"] = datacheck_states[0].get("status") if datacheck_states else None
         row["analysis_status"] = analysis_states[0].get("status") if analysis_states else None
         history_rows.append(row)
-        attempt_rows.append(
-            {
-                "batch_id": batch_id,
-                "case_id": candidate["case_id"],
-                "attempt_id": candidate.get("attempt_id"),
-                "angle_deg": candidate.get("angle_deg"),
-                "g1c": candidate.get("g1c"),
-                "job_name": case.get("job_name"),
-            }
-        )
+        for job_name in (case.get("job_name"), case.get("datacheck_job_name")):
+            if job_name:
+                attempt_rows.append(
+                    {
+                        "batch_id": batch_id,
+                        "case_id": candidate["case_id"],
+                        "attempt_id": candidate.get("attempt_id"),
+                        "angle_deg": candidate.get("angle_deg"),
+                        "g1c": candidate.get("g1c"),
+                        "job_name": job_name,
+                    }
+                )
     append_calibration_history(history_csv, history_rows)
     archive_result = None
     if archive_root is not None:
