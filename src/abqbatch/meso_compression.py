@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import csv
 import json
 import math
@@ -10,11 +11,12 @@ import shutil
 import subprocess
 import time
 import zipfile
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import datetime
 from html import escape as xml_escape
 from pathlib import Path
 from typing import Annotated, Any
+from xml.etree import ElementTree as ET
 
 import typer
 
@@ -28,6 +30,32 @@ PIPELINE_VERSION = "meso-compression-v1"
 DEFAULT_RUN_DIR = Path("runs/puckzt_angle_0p8_g1c5_compression_35inp")
 DEFAULT_SMOKE_CASE = "13-12-24"
 MANIFEST_NAME = "manifest.json"
+TARGET_ONLY = "TARGET_ONLY"
+REFERENCE_SIM = "REFERENCE_SIM"
+CURRENT_SIM = "CURRENT_SIM"
+SIM_DATA_ROLES = {REFERENCE_SIM, CURRENT_SIM}
+ANGLE_MIN_DEG = 1.0
+ANGLE_MAX_DEG = 3.0
+G1C_MIN = 5.0
+G1C_MAX = 120.0
+ACCEPTANCE_ERROR_PCT = 15.0
+DEFAULT_MAX_NEW_ATTEMPTS = 3
+DEFAULT_CALIBRATION_BATCH_SIZE = 6
+DEFAULT_TARGET_GROUPS = {0: "QJ", 1: "13", 2: "132"}
+DEFAULT_EXCLUDED_CALIBRATION_CASES = {
+    "qj-24-24",
+    "13-24-24",
+    "13-24-48",
+    "13-24-72",
+}
+DEFAULT_132_48_72_SOURCE = (
+    Path("D:/ZDYF-NBY-ZJY")
+    / "\u8d44\u6599"
+    / "inp"
+    / "inp\u7edf\u8ba1-JQ"
+    / "inp\u7edf\u8ba1-JQ"
+    / "132-48-72-jq.inp"
+)
 
 
 def _now() -> str:
@@ -1349,6 +1377,1260 @@ def write_results_xlsx(run_dir: Path, output: Path | None = None) -> Path:
             "provenance": provenance,
         },
     )
+
+def _xlsx_relation_targets(archive: zipfile.ZipFile) -> dict[str, str]:
+    root = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+    targets: dict[str, str] = {}
+    for relation in root.findall("{*}Relationship"):
+        relation_id = relation.get("Id")
+        target = relation.get("Target")
+        if relation_id and target:
+            targets[relation_id] = target
+    return targets
+
+
+def _xlsx_shared_strings(archive: zipfile.ZipFile) -> list[str]:
+    if "xl/sharedStrings.xml" not in archive.namelist():
+        return []
+    root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+    strings = []
+    for item in root.findall("{*}si"):
+        strings.append("".join(node.text or "" for node in item.findall(".//{*}t")))
+    return strings
+
+
+def _xlsx_cell_column(ref: str | None, fallback: int) -> int:
+    if not ref:
+        return fallback
+    match = re.match(r"([A-Za-z]+)", ref)
+    if not match:
+        return fallback
+    index = 0
+    for char in match.group(1).upper():
+        index = index * 26 + ord(char) - ord("A") + 1
+    return index
+
+
+def _xlsx_cell_value(cell: ET.Element, shared_strings: list[str]) -> Any:
+    cell_type = cell.get("t")
+    if cell_type == "inlineStr":
+        return "".join(node.text or "" for node in cell.findall(".//{*}t"))
+    value_node = cell.find("{*}v")
+    if value_node is None or value_node.text is None:
+        return None
+    raw = value_node.text
+    if cell_type == "s":
+        index = int(raw)
+        return shared_strings[index] if 0 <= index < len(shared_strings) else raw
+    if cell_type == "b":
+        return raw.strip() in {"1", "true", "TRUE"}
+    try:
+        value = float(raw)
+    except ValueError:
+        return raw
+    if value.is_integer():
+        return int(value)
+    return value
+
+
+def read_xlsx_rows(path: Path, sheet_name: str | None = None) -> list[list[Any]]:
+    """Read one worksheet from a simple XLSX without adding an openpyxl dependency."""
+
+    with zipfile.ZipFile(path) as archive:
+        workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+        targets = _xlsx_relation_targets(archive)
+        sheets = []
+        relationship_id_attr = (
+            "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+        )
+        for sheet in workbook.findall(".//{*}sheet"):
+            name = sheet.get("name")
+            relationship_id = sheet.get(relationship_id_attr)
+            if name and relationship_id:
+                sheets.append((name, relationship_id))
+        if not sheets:
+            raise ValueError(f"No worksheets found in {path}")
+        selected = next((item for item in sheets if item[0] == sheet_name), None)
+        if selected is None:
+            if sheet_name is not None:
+                names = ", ".join(name for name, _ in sheets)
+                raise ValueError(
+                    f"Worksheet {sheet_name!r} not found in {path}; available: {names}"
+                )
+            selected = sheets[0]
+        target = targets[selected[1]]
+        sheet_path = target.lstrip("/") if target.startswith("/") else f"xl/{target}"
+        shared_strings = _xlsx_shared_strings(archive)
+        sheet_root = ET.fromstring(archive.read(sheet_path))
+    rows: list[list[Any]] = []
+    for row in sheet_root.findall(".//{*}row"):
+        values: list[Any] = []
+        fallback_col = 1
+        for cell in row.findall("{*}c"):
+            col = _xlsx_cell_column(cell.get("r"), fallback_col)
+            while len(values) < col - 1:
+                values.append(None)
+            values.append(_xlsx_cell_value(cell, shared_strings))
+            fallback_col = col + 1
+        rows.append(values)
+    return rows
+
+
+def _coerce_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    if text.endswith("%"):
+        text = text[:-1]
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _coerce_int(value: Any) -> int | None:
+    number = _coerce_float(value)
+    if number is None:
+        return None
+    rounded = round(number)
+    if abs(number - rounded) > 1e-9:
+        return None
+    return int(rounded)
+
+
+def _header_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+
+
+def _dict_rows(rows: list[list[Any]]) -> list[dict[str, Any]]:
+    header: list[str] | None = None
+    data_rows: list[dict[str, Any]] = []
+    for row in rows:
+        if not any(cell is not None and str(cell).strip() for cell in row):
+            continue
+        if header is None:
+            header = [_header_key(cell) for cell in row]
+            continue
+        record: dict[str, Any] = {}
+        for index, key in enumerate(header):
+            if key:
+                record[key] = row[index] if index < len(row) else None
+        data_rows.append(record)
+    return data_rows
+
+
+def _case_key(case_id: str) -> str:
+    return case_id.strip().lower()
+
+
+def _target_case_id(group_value: Any, dim_a: Any, dim_b: Any) -> str | None:
+    group_index = _coerce_int(group_value)
+    dim_a_int = _coerce_int(dim_a)
+    dim_b_int = _coerce_int(dim_b)
+    if dim_a_int is None or dim_b_int is None:
+        return None
+    group_name: str | None = None
+    if group_index is not None:
+        group_name = DEFAULT_TARGET_GROUPS.get(group_index)
+    if group_name is None:
+        raw_group = str(group_value).strip()
+        if raw_group.lower() in {"qj", "0"}:
+            group_name = "QJ"
+        elif raw_group in {"13", "1"}:
+            group_name = "13"
+        elif raw_group in {"132", "2"}:
+            group_name = "132"
+    if group_name is None:
+        return None
+    if group_name.upper() == "QJ":
+        return f"QJ-{dim_a_int}-{dim_b_int}"
+    return f"{group_name}-{dim_a_int}-{dim_b_int}"
+
+
+def _default_source_inp(case_id: str) -> Path:
+    if case_id.upper().startswith("QJ-"):
+        return Path("qj") / f"{case_id}.inp"
+    if case_id.startswith("132-"):
+        return Path("132") / f"{case_id}.inp"
+    return Path("13-inp") / f"{case_id}.inp"
+
+
+def parse_strength_targets(
+    target_xlsx: Path,
+    *,
+    sheet_name: str = "Sheet1",
+    excluded_case_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Parse target strengths from Sheet1; these rows never become interpolation points."""
+
+    excluded = excluded_case_ids or DEFAULT_EXCLUDED_CALIBRATION_CASES
+    rows = read_xlsx_rows(target_xlsx, sheet_name=sheet_name)
+    targets: list[dict[str, Any]] = []
+    for row_index, row in enumerate(rows, start=1):
+        if len(row) < 5:
+            continue
+        case_id = _target_case_id(row[0], row[1], row[2])
+        target_strength = _coerce_float(row[4])
+        if case_id is None or target_strength is None:
+            continue
+        source_inp = (
+            DEFAULT_132_48_72_SOURCE
+            if _case_key(case_id) == "132-48-72"
+            else _default_source_inp(case_id)
+        )
+        targets.append(
+            {
+                "data_role": TARGET_ONLY,
+                "case_id": case_id,
+                "case_key": _case_key(case_id),
+                "target_strength_mpa": target_strength,
+                "target_xlsx": str(target_xlsx),
+                "target_sheet": sheet_name,
+                "target_row": row_index,
+                "source_inp": str(source_inp),
+                "excluded": _case_key(case_id) in excluded,
+            }
+        )
+    return targets
+
+
+def _first_present(row: dict[str, Any], keys: Iterable[str]) -> Any:
+    for key in keys:
+        normalized = _header_key(key)
+        if normalized in row and row[normalized] not in {None, ""}:
+            return row[normalized]
+    return None
+
+
+def _parse_param_token(token: str) -> float | None:
+    token = token.strip().lower().replace("p", ".")
+    return _coerce_float(token)
+
+
+def _infer_angle_g1c(row: dict[str, Any]) -> tuple[float | None, float | None]:
+    haystack = " ".join(
+        str(value)
+        for key, value in row.items()
+        if key in {"candidate_id", "job_name", "datacheck_job_name", "batch", "source_inp"}
+        and value is not None
+    )
+    match = re.search(r"angle[_-]([0-9]+(?:p[0-9]+|\.[0-9]+)?)", haystack, re.IGNORECASE)
+    angle = _parse_param_token(match.group(1)) if match else None
+    match = re.search(r"g1c[_-]?([0-9]+(?:p[0-9]+|\.[0-9]+)?)", haystack, re.IGNORECASE)
+    g1c = _parse_param_token(match.group(1)) if match else None
+    return angle, g1c
+
+
+def parse_sim_summary_xlsx(
+    summary_xlsx: Path,
+    *,
+    data_role: str,
+    sheet_name: str = "all_cases_summary",
+    default_angle_deg: float | None = None,
+    default_g1c: float | None = None,
+) -> list[dict[str, Any]]:
+    """Parse actual simulation points from a summary workbook."""
+
+    if data_role not in SIM_DATA_ROLES:
+        raise ValueError(f"Simulation summary must use a simulation data_role, got {data_role!r}")
+    try:
+        raw_rows = read_xlsx_rows(summary_xlsx, sheet_name=sheet_name)
+    except ValueError:
+        raw_rows = read_xlsx_rows(summary_xlsx)
+    records: list[dict[str, Any]] = []
+    for row_index, row in enumerate(_dict_rows(raw_rows), start=2):
+        case_id = _first_present(row, ["case_id"])
+        strength = _coerce_float(
+            _first_present(
+                row, ["compressive_strength_mpa", "compression_strength_mpa", "strength_mpa"]
+            )
+        )
+        if not case_id or strength is None:
+            continue
+        inferred_angle, inferred_g1c = _infer_angle_g1c(row)
+        angle = _coerce_float(_first_present(row, ["angle_deg", "fiber_angle_deg", "angle"]))
+        g1c = _coerce_float(_first_present(row, ["g1c", "g1c_j_mm2", "G1C"]))
+        angle = (
+            angle
+            if angle is not None
+            else (inferred_angle if inferred_angle is not None else default_angle_deg)
+        )
+        g1c = (
+            g1c if g1c is not None else (inferred_g1c if inferred_g1c is not None else default_g1c)
+        )
+        if angle is None or g1c is None:
+            continue
+        case_id_text = str(case_id).strip()
+        records.append(
+            {
+                "data_role": data_role,
+                "case_id": case_id_text,
+                "case_key": _case_key(case_id_text),
+                "angle_deg": float(angle),
+                "g1c": float(g1c),
+                "compressive_strength_mpa": float(strength),
+                "status": _first_present(row, ["status"]),
+                "job_name": _first_present(row, ["job_name"]),
+                "attempt_id": _first_present(row, ["attempt_id"]),
+                "batch_id": _first_present(row, ["batch_id", "batch"]),
+                "summary_xlsx": str(summary_xlsx),
+                "summary_row": row_index,
+            }
+        )
+    return records
+
+
+def read_calibration_history(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8-sig", newline="") as stream:
+        reader = csv.DictReader(stream)
+        for row_index, row in enumerate(reader, start=2):
+            role = row.get("data_role") or CURRENT_SIM
+            if role not in SIM_DATA_ROLES:
+                raise ValueError(
+                    f"History row {row_index} has invalid simulation data_role: {role!r}"
+                )
+            case_id = str(row.get("case_id") or "").strip()
+            strength = _coerce_float(row.get("compressive_strength_mpa"))
+            angle = _coerce_float(row.get("angle_deg"))
+            g1c = _coerce_float(row.get("g1c"))
+            if not case_id or strength is None or angle is None or g1c is None:
+                continue
+            records.append(
+                {
+                    "data_role": role,
+                    "case_id": case_id,
+                    "case_key": _case_key(case_id),
+                    "angle_deg": angle,
+                    "g1c": g1c,
+                    "compressive_strength_mpa": strength,
+                    "status": row.get("status"),
+                    "job_name": row.get("job_name"),
+                    "attempt_id": row.get("attempt_id"),
+                    "batch_id": row.get("batch_id"),
+                    "history_csv": str(path),
+                    "history_row": row_index,
+                }
+            )
+    return records
+
+
+def append_calibration_history(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    headers = [
+        "data_role",
+        "batch_id",
+        "case_id",
+        "attempt_id",
+        "angle_deg",
+        "g1c",
+        "target_strength_mpa",
+        "compressive_strength_mpa",
+        "error_pct",
+        "accepted",
+        "status",
+        "job_name",
+        "run_dir",
+        "state_json",
+        "summary_json",
+        "curve_csv",
+    ]
+    exists = path.exists()
+    with path.open("a", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=headers, extrasaction="ignore")
+        if not exists:
+            writer.writeheader()
+        for row in rows:
+            out = dict(row)
+            out["data_role"] = out.get("data_role") or CURRENT_SIM
+            writer.writerow(out)
+
+
+def strength_error_pct(*, target_strength_mpa: float, simulated_strength_mpa: float) -> float:
+    if target_strength_mpa <= 0:
+        raise ValueError("Target strength must be positive for relative error calculation")
+    return abs(simulated_strength_mpa - target_strength_mpa) / target_strength_mpa * 100.0
+
+
+def _assert_simulation_records(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    checked = list(records)
+    bad_roles = sorted(
+        {
+            str(record.get("data_role"))
+            for record in checked
+            if record.get("data_role") not in SIM_DATA_ROLES
+        }
+    )
+    if bad_roles:
+        raise ValueError(
+            f"Interpolator input includes non-simulation data_role(s): {', '.join(bad_roles)}"
+        )
+    return checked
+
+
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def _same_param(value: float) -> float:
+    return round(float(value), 6)
+
+
+def _sampled(records: list[dict[str, Any]], angle_deg: float, g1c: float) -> bool:
+    return any(
+        abs(float(record["angle_deg"]) - angle_deg) <= 1e-6
+        and abs(float(record["g1c"]) - g1c) <= 1e-6
+        for record in records
+    )
+
+
+def _within_calibration_bounds(record: dict[str, Any]) -> bool:
+    angle = float(record["angle_deg"])
+    g1c = float(record["g1c"])
+    return ANGLE_MIN_DEG <= angle <= ANGLE_MAX_DEG and G1C_MIN <= g1c <= G1C_MAX
+
+
+def _brackets(target_strength: float, left: float, right: float) -> bool:
+    return min(left, right) <= target_strength <= max(left, right) and abs(left - right) > 1e-9
+
+
+def _linear_inverse(target_strength: float, x1: float, y1: float, x2: float, y2: float) -> float:
+    return x1 + (target_strength - y1) * (x2 - x1) / (y2 - y1)
+
+
+def _candidate_from_sim_bracket(
+    records: list[dict[str, Any]],
+    *,
+    target_strength: float,
+) -> dict[str, Any] | None:
+    by_g1c: dict[float, list[dict[str, Any]]] = {}
+    by_angle: dict[float, list[dict[str, Any]]] = {}
+    for record in records:
+        by_g1c.setdefault(_same_param(record["g1c"]), []).append(record)
+        by_angle.setdefault(_same_param(record["angle_deg"]), []).append(record)
+
+    candidates: list[dict[str, Any]] = []
+    for g1c, group in by_g1c.items():
+        ordered = sorted(group, key=lambda item: float(item["angle_deg"]))
+        for left, right in zip(ordered, ordered[1:], strict=False):
+            y1 = float(left["compressive_strength_mpa"])
+            y2 = float(right["compressive_strength_mpa"])
+            if not _brackets(target_strength, y1, y2):
+                continue
+            angle = _linear_inverse(
+                target_strength, float(left["angle_deg"]), y1, float(right["angle_deg"]), y2
+            )
+            angle = _clamp(angle, ANGLE_MIN_DEG, ANGLE_MAX_DEG)
+            candidates.append(
+                {
+                    "angle_deg": angle,
+                    "g1c": float(g1c),
+                    "reason": "same_g1c_strength_bracket",
+                    "span_mpa": abs(y2 - y1),
+                }
+            )
+    for angle, group in by_angle.items():
+        ordered = sorted(group, key=lambda item: float(item["g1c"]))
+        for left, right in zip(ordered, ordered[1:], strict=False):
+            y1 = float(left["compressive_strength_mpa"])
+            y2 = float(right["compressive_strength_mpa"])
+            g1c1 = float(left["g1c"])
+            g1c2 = float(right["g1c"])
+            if g1c1 <= 0 or g1c2 <= 0 or not _brackets(target_strength, y1, y2):
+                continue
+            log_g1c = _linear_inverse(target_strength, math.log(g1c1), y1, math.log(g1c2), y2)
+            g1c = _clamp(math.exp(log_g1c), G1C_MIN, G1C_MAX)
+            candidates.append(
+                {
+                    "angle_deg": float(angle),
+                    "g1c": g1c,
+                    "reason": "same_angle_log_g1c_strength_bracket",
+                    "span_mpa": abs(y2 - y1),
+                }
+            )
+    for candidate in sorted(
+        candidates, key=lambda item: (item["span_mpa"], item["g1c"], item["angle_deg"])
+    ):
+        candidate["angle_deg"] = round(float(candidate["angle_deg"]), 4)
+        candidate["g1c"] = round(float(candidate["g1c"]), 4)
+        if not _sampled(records, candidate["angle_deg"], candidate["g1c"]):
+            return candidate
+    return None
+
+
+def _fallback_candidate(
+    records: list[dict[str, Any]], *, target_strength: float
+) -> dict[str, Any] | None:
+    if not records:
+        return {"angle_deg": ANGLE_MIN_DEG, "g1c": G1C_MIN, "reason": "initial_exploration"}
+    best = min(
+        records,
+        key=lambda item: abs(float(item["compressive_strength_mpa"]) - target_strength),
+    )
+    best_strength = float(best["compressive_strength_mpa"])
+    if best_strength > target_strength:
+        grid = [(3.0, 5.0), (2.5, 5.0), (2.0, 5.0), (3.0, 15.0), (2.0, 15.0), (1.0, 5.0)]
+        reason = "nearest_sim_above_target_reduce_strength"
+    else:
+        grid = [(1.0, 120.0), (1.0, 80.0), (1.5, 120.0), (1.0, 60.0), (2.0, 120.0), (1.0, 30.0)]
+        reason = "nearest_sim_below_target_raise_strength"
+    for angle, g1c in grid:
+        if not _sampled(records, angle, g1c):
+            return {"angle_deg": angle, "g1c": g1c, "reason": reason}
+    return None
+
+
+def select_strength_candidate(
+    target: dict[str, Any],
+    sim_records: Iterable[dict[str, Any]],
+    *,
+    max_new_attempts: int = DEFAULT_MAX_NEW_ATTEMPTS,
+    acceptance_error_pct: float = ACCEPTANCE_ERROR_PCT,
+) -> dict[str, Any]:
+    records = [
+        record
+        for record in _assert_simulation_records(sim_records)
+        if record.get("case_key") == target.get("case_key")
+    ]
+    target_strength = float(target["target_strength_mpa"])
+    accepted_records = []
+    for record in records:
+        error = strength_error_pct(
+            target_strength_mpa=target_strength,
+            simulated_strength_mpa=float(record["compressive_strength_mpa"]),
+        )
+        if error <= acceptance_error_pct and _within_calibration_bounds(record):
+            accepted_records.append((error, record))
+    if accepted_records:
+        error, record = min(accepted_records, key=lambda item: item[0])
+        return {
+            "status": "accepted",
+            "case_id": target["case_id"],
+            "case_key": target["case_key"],
+            "target_strength_mpa": target_strength,
+            "best_error_pct": round(error, 6),
+            "accepted_source_role": record["data_role"],
+            "accepted_angle_deg": record["angle_deg"],
+            "accepted_g1c": record["g1c"],
+            "reason": "simulation_within_error_limit",
+        }
+
+    current_attempts = sum(1 for record in records if record.get("data_role") == CURRENT_SIM)
+    if current_attempts >= max_new_attempts:
+        best_error = None
+        if records:
+            best_error = min(
+                strength_error_pct(
+                    target_strength_mpa=target_strength,
+                    simulated_strength_mpa=float(record["compressive_strength_mpa"]),
+                )
+                for record in records
+            )
+        return {
+            "status": "max_attempts_reached",
+            "case_id": target["case_id"],
+            "case_key": target["case_key"],
+            "target_strength_mpa": target_strength,
+            "current_attempts": current_attempts,
+            "best_error_pct": round(best_error, 6) if best_error is not None else None,
+            "reason": "max_new_attempts_reached_without_acceptance",
+        }
+
+    candidate = _candidate_from_sim_bracket(records, target_strength=target_strength)
+    if candidate is None:
+        candidate = _fallback_candidate(records, target_strength=target_strength)
+    if candidate is None:
+        return {
+            "status": "no_unsampled_candidate",
+            "case_id": target["case_id"],
+            "case_key": target["case_key"],
+            "target_strength_mpa": target_strength,
+            "current_attempts": current_attempts,
+            "reason": "exploration_grid_exhausted",
+        }
+    attempt_id = current_attempts + 1
+    return {
+        "status": "planned",
+        "case_id": target["case_id"],
+        "case_key": target["case_key"],
+        "target_strength_mpa": target_strength,
+        "attempt_id": attempt_id,
+        "angle_deg": float(candidate["angle_deg"]),
+        "g1c": float(candidate["g1c"]),
+        "source_inp": target.get("source_inp"),
+        "planned_data_role": CURRENT_SIM,
+        "reason": candidate["reason"],
+        "current_attempts": current_attempts,
+    }
+
+
+def build_calibration_plan(
+    targets: list[dict[str, Any]],
+    sim_records: list[dict[str, Any]],
+    *,
+    case_ids: set[str] | None = None,
+    batch_size: int = DEFAULT_CALIBRATION_BATCH_SIZE,
+    max_new_attempts: int = DEFAULT_MAX_NEW_ATTEMPTS,
+) -> dict[str, Any]:
+    _assert_simulation_records(sim_records)
+    selected_case_keys = {_case_key(case_id) for case_id in case_ids} if case_ids else None
+    decisions: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+    active_targets = [
+        target
+        for target in targets
+        if target.get("data_role") == TARGET_ONLY
+        and not target.get("excluded")
+        and (selected_case_keys is None or target.get("case_key") in selected_case_keys)
+    ]
+    for target in sorted(active_targets, key=lambda item: str(item["case_id"])):
+        decision = select_strength_candidate(
+            target,
+            sim_records,
+            max_new_attempts=max_new_attempts,
+        )
+        decisions.append(decision)
+        if decision["status"] == "planned" and len(candidates) < batch_size:
+            candidate = dict(decision)
+            candidate["batch_slot"] = len(candidates) + 1
+            candidates.append(candidate)
+    return {
+        "created_at": _now(),
+        "pipeline_version": PIPELINE_VERSION,
+        "target_count": len(targets),
+        "active_target_count": len(active_targets),
+        "simulation_point_count": len(sim_records),
+        "batch_size": batch_size,
+        "candidate_count": len(candidates),
+        "decisions": decisions,
+        "candidates": candidates,
+    }
+
+
+def _dict_sheet(rows: list[dict[str, Any]], headers: list[str] | None = None) -> list[list[Any]]:
+    if headers is None:
+        seen: list[str] = []
+        for row in rows:
+            for key in row:
+                if key not in seen:
+                    seen.append(key)
+        headers = seen or ["status"]
+    return [headers] + [[row.get(header) for header in headers] for row in rows]
+
+
+def write_calibration_outputs(
+    output_root: Path,
+    plan: dict[str, Any],
+    targets: list[dict[str, Any]],
+    sim_records: list[dict[str, Any]],
+) -> dict[str, Path]:
+    output_root.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_root / "calibration_manifest.json"
+    candidates_csv = output_root / "next_candidates.csv"
+    xlsx_path = output_root / "calibration_summary.xlsx"
+    _write_json(manifest_path, plan)
+    candidate_headers = [
+        "batch_slot",
+        "case_id",
+        "attempt_id",
+        "angle_deg",
+        "g1c",
+        "target_strength_mpa",
+        "planned_data_role",
+        "reason",
+        "source_inp",
+    ]
+    with candidates_csv.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=candidate_headers, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(plan["candidates"])
+    write_xlsx(
+        xlsx_path,
+        {
+            "next_candidates": _dict_sheet(plan["candidates"], candidate_headers),
+            "decisions": _dict_sheet(plan["decisions"]),
+            "targets": _dict_sheet(targets),
+            "simulation_points": _dict_sheet(sim_records),
+        },
+    )
+    return {"manifest": manifest_path, "candidates_csv": candidates_csv, "xlsx": xlsx_path}
+
+
+
+
+def _param_slug(value: float) -> str:
+    return f"{float(value):.4g}".replace("-", "m").replace(".", "p")
+
+
+def calibration_candidate_id(candidate: dict[str, Any]) -> str:
+    return (
+        f"cal_a{_param_slug(float(candidate['angle_deg']))}_"
+        f"g{_param_slug(float(candidate['g1c']))}_"
+        f"t{int(candidate.get('attempt_id') or 1)}"
+    )
+
+
+def _resolve_existing_path(path_text: str | Path, *, base_dir: Path | None = None) -> Path:
+    path = Path(path_text)
+    candidates = [path]
+    if not path.is_absolute():
+        if base_dir is not None:
+            candidates.append(base_dir / path)
+        candidates.append(Path.cwd() / path)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    raise FileNotFoundError(f"Could not resolve path: {path_text}")
+
+
+def patch_umat_angle(text: str, angle_deg: float) -> str:
+    replacement = rf"\g<1>{float(angle_deg):.10g}\g<2>"
+    patched, count = re.subn(
+        r"(?im)^(\s*ANGLE_INI\s*=\s*)[0-9.+\-EeDd]+(\s*/\s*180\.\s*\*\s*3\.141592654\s*)$",
+        replacement,
+        text,
+        count=1,
+    )
+    if count != 1:
+        raise ValueError("Could not find active ANGLE_INI assignment in UMAT")
+    return patched
+
+
+def build_calibration_candidate_params(
+    base_params: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    output_dir: Path,
+) -> dict[str, Any]:
+    params = copy.deepcopy(base_params)
+    case_id = str(candidate["case_id"])
+    angle = float(candidate["angle_deg"])
+    g1c = float(candidate["g1c"])
+    candidate_id = calibration_candidate_id(candidate)
+    params["candidate_id"] = candidate_id
+    params["purpose"] = f"adaptive compression calibration {case_id} {candidate_id}"
+    candidate_parameters = params.setdefault("candidate_parameters", {})
+    candidate_parameters.update(
+        {
+            "fiber_angle_deg": angle,
+            "g1c": g1c,
+            "calibration_case_id": case_id,
+            "calibration_attempt_id": candidate.get("attempt_id"),
+            "calibration_data_role": CURRENT_SIM,
+        }
+    )
+    for material_name in ("WARP", "WEFT"):
+        params["materials"][material_name]["constants"]["G1C"] = g1c
+
+    umat_source = next(
+        (
+            path
+            for path in (
+                _resolve_project_path(params, params.get("umat", {}).get("working_copy")),
+                _resolve_project_path(params, params.get("umat", {}).get("source")),
+            )
+            if path is not None and path.exists()
+        ),
+        None,
+    )
+    if umat_source is None:
+        raise FileNotFoundError("Could not resolve UMAT working_copy or source from params JSON")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    umat_target = output_dir / f"{candidate_id}_{Path(umat_source).name}"
+    umat_text = Path(umat_source).read_text(encoding="utf-8", errors="ignore")
+    umat_target.write_text(patch_umat_angle(umat_text, angle), encoding="utf-8", newline="")
+    params.setdefault("umat", {})["working_copy"] = str(umat_target.resolve())
+    params["umat"]["angle_assignment"] = f"ANGLE_INI={angle:.10g}/180.*3.141592654"
+    return params
+
+
+def prepare_calibration_candidate(
+    *,
+    params_json: Path,
+    candidate: dict[str, Any],
+    batch_dir: Path,
+    force: bool = False,
+) -> dict[str, Any]:
+    base_params = _read_json(params_json)
+    case_id = str(candidate["case_id"])
+    candidate_id = calibration_candidate_id(candidate)
+    attempt_name = f"{int(candidate.get('batch_slot') or 1):02d}_{case_id}_{candidate_id}"
+    attempt_dir = batch_dir / attempt_name
+    input_dir = attempt_dir / "source_inp"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    source_inp = _resolve_existing_path(
+        candidate["source_inp"],
+        base_dir=Path(params_json).resolve().parent,
+    )
+    canonical_source = input_dir / f"{case_id}.inp"
+    shutil.copy2(source_inp, canonical_source)
+    params_dir = attempt_dir / "params"
+    params = build_calibration_candidate_params(
+        base_params,
+        candidate,
+        output_dir=params_dir / "umats",
+    )
+    params_path = params_dir / f"{candidate_id}_params.json"
+    _write_json(params_path, params)
+    run_dir = attempt_dir / "run"
+    manifest = prepare_batch(
+        params_json=params_path,
+        input_dir=input_dir,
+        run_dir=run_dir,
+        force=force,
+    )
+    manifest["calibration_candidate"] = {
+        key: value for key, value in candidate.items() if isinstance(value, (str, int, float, bool))
+    }
+    _write_manifest(run_dir, manifest)
+    return {
+        "candidate": candidate,
+        "attempt_dir": str(attempt_dir),
+        "run_dir": str(run_dir),
+        "params_json": str(params_path),
+        "manifest": manifest,
+        "case": manifest["cases"][0],
+    }
+
+
+def calibration_history_row_from_case(
+    *,
+    candidate: dict[str, Any],
+    case: dict[str, Any],
+    batch_id: str,
+) -> dict[str, Any]:
+    state = read_case_state(case)
+    summary_path = Path(case["summary_json"])
+    summary = _read_json(summary_path) if summary_path.exists() else {}
+    metrics = summary.get("metrics") or state.get("metrics") or {}
+    strength = _coerce_float(metrics.get("compressive_strength_mpa"))
+    target_strength = _coerce_float(candidate.get("target_strength_mpa"))
+    error = None
+    accepted = None
+    if strength is not None and target_strength is not None:
+        error = strength_error_pct(
+            target_strength_mpa=target_strength,
+            simulated_strength_mpa=strength,
+        )
+        accepted = error <= ACCEPTANCE_ERROR_PCT
+    return {
+        "data_role": CURRENT_SIM,
+        "batch_id": batch_id,
+        "case_id": candidate["case_id"],
+        "case_key": candidate.get("case_key") or _case_key(str(candidate["case_id"])),
+        "attempt_id": candidate.get("attempt_id"),
+        "angle_deg": candidate.get("angle_deg"),
+        "g1c": candidate.get("g1c"),
+        "target_strength_mpa": target_strength,
+        "compressive_strength_mpa": strength,
+        "error_pct": round(error, 6) if error is not None else None,
+        "accepted": accepted,
+        "status": state.get("status"),
+        "job_name": case.get("job_name"),
+        "run_dir": str(Path(case["case_dir"]).parent.parent.parent),
+        "state_json": str(_case_state_path(case)),
+        "summary_json": case.get("summary_json"),
+        "curve_csv": case.get("curve_csv"),
+    }
+
+
+def run_calibration_batch(
+    *,
+    params_json: Path,
+    candidates: list[dict[str, Any]],
+    output_root: Path,
+    batch_id: str,
+    history_csv: Path,
+    archive_root: Path | None = None,
+    dry_run: bool = False,
+    force: bool = False,
+) -> dict[str, Any]:
+    batch_dir = output_root / "batches" / batch_id
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    prepared: list[dict[str, Any]] = []
+    history_rows: list[dict[str, Any]] = []
+    attempt_rows: list[dict[str, Any]] = []
+    for candidate in candidates:
+        prepared_attempt = prepare_calibration_candidate(
+            params_json=params_json,
+            candidate=candidate,
+            batch_dir=batch_dir,
+            force=force,
+        )
+        prepared.append(
+            {
+                "case_id": candidate["case_id"],
+                "attempt_id": candidate.get("attempt_id"),
+                "angle_deg": candidate.get("angle_deg"),
+                "g1c": candidate.get("g1c"),
+                "run_dir": prepared_attempt["run_dir"],
+                "params_json": prepared_attempt["params_json"],
+            }
+        )
+        run_dir = Path(prepared_attempt["run_dir"])
+        datacheck_states = datacheck_cases(run_dir, dry_run=dry_run)
+        analysis_states = analysis_cases(run_dir, dry_run=dry_run)
+        case = load_manifest(run_dir)["cases"][0]
+        row = calibration_history_row_from_case(candidate=candidate, case=case, batch_id=batch_id)
+        row["datacheck_status"] = datacheck_states[0].get("status") if datacheck_states else None
+        row["analysis_status"] = analysis_states[0].get("status") if analysis_states else None
+        history_rows.append(row)
+        attempt_rows.append(
+            {
+                "batch_id": batch_id,
+                "case_id": candidate["case_id"],
+                "attempt_id": candidate.get("attempt_id"),
+                "angle_deg": candidate.get("angle_deg"),
+                "g1c": candidate.get("g1c"),
+                "job_name": case.get("job_name"),
+            }
+        )
+    append_calibration_history(history_csv, history_rows)
+    archive_result = None
+    if archive_root is not None:
+        raw_archive_result = archive_odb_files(
+            batch_dir,
+            archive_root=archive_root,
+            index_dir=output_root / "archive_indexes",
+            batch_id=batch_id,
+            attempt_rows=attempt_rows,
+        )
+        archive_result = {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in raw_archive_result.items()
+        }
+    result = {
+        "batch_id": batch_id,
+        "batch_dir": str(batch_dir),
+        "history_csv": str(history_csv),
+        "prepared": prepared,
+        "history_rows": history_rows,
+        "attempt_rows": attempt_rows,
+        "archive": archive_result,
+    }
+    _write_json(output_root / f"{batch_id}_execution_summary.json", result)
+    return result
+
+
+def archive_odb_files(
+    run_dir: Path,
+    *,
+    archive_root: Path,
+    index_dir: Path,
+    batch_id: str,
+    attempt_rows: list[dict[str, Any]],
+    stamp: str | None = None,
+    file_glob: str = "*.odb",
+    move_file: Callable[[Path, Path], None] | None = None,
+) -> dict[str, Path | int]:
+    stamp = stamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_dir = archive_root / f"compression_calibration_{stamp}" / batch_id
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    index_dir.mkdir(parents=True, exist_ok=True)
+    attempts_by_job = {str(row.get("job_name")): row for row in attempt_rows if row.get("job_name")}
+    rows: list[dict[str, Any]] = []
+    for odb in sorted(run_dir.rglob(file_glob)):
+        original_path = odb.resolve()
+        try:
+            relative = original_path.relative_to(run_dir.resolve())
+        except ValueError:
+            relative = Path(odb.name)
+        job_name = odb.stem
+        attempt = attempts_by_job.get(job_name, {})
+        size = odb.stat().st_size
+        digest = sha256_file(odb)
+        archive_path = archive_dir / relative
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        if move_file is None:
+            shutil.move(str(odb), str(archive_path))
+            if odb.exists():
+                raise PermissionError(f"ODB archive move left source file in place: {odb}")
+        else:
+            move_file(odb, archive_path)
+        rows.append(
+            {
+                "archived_at": _now(),
+                "batch_id": batch_id,
+                "case_id": attempt.get("case_id"),
+                "attempt_id": attempt.get("attempt_id"),
+                "angle_deg": attempt.get("angle_deg"),
+                "g1c": attempt.get("g1c"),
+                "original_path": str(original_path),
+                "archive_path": str(archive_path.resolve()),
+                "size_bytes": size,
+                "sha256": digest,
+                "job_name": job_name,
+            }
+        )
+    headers = [
+        "archived_at",
+        "batch_id",
+        "case_id",
+        "attempt_id",
+        "angle_deg",
+        "g1c",
+        "original_path",
+        "archive_path",
+        "size_bytes",
+        "sha256",
+        "job_name",
+    ]
+    d_index = index_dir / f"{batch_id}_odb_archive_index.csv"
+    e_index = archive_dir / f"{batch_id}_odb_archive_index.csv"
+    for index_path in (d_index, e_index):
+        with index_path.open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=headers)
+            writer.writeheader()
+            writer.writerows(rows)
+    return {
+        "archive_dir": archive_dir,
+        "d_index": d_index,
+        "e_index": e_index,
+        "archived_count": len(rows),
+    }
+
+
+@app.command("calibrate-strength")
+def calibrate_strength_command(
+    target_xlsx: Annotated[
+        Path,
+        typer.Option(
+            "--target-xlsx",
+            help="Static strength dataset XLSX; Sheet1 column 5 is the compression target.",
+        ),
+    ],
+    reference_summary_xlsx: Annotated[
+        list[Path] | None,
+        typer.Option(
+            "--reference-summary-xlsx",
+            help="Previous-round actual simulation summary XLSX. May be repeated.",
+        ),
+    ] = None,
+    params_json: Annotated[
+        Path | None,
+        typer.Option("--params-json", help="Base compression parameter JSON for execution."),
+    ] = None,
+    current_summary_xlsx: Annotated[
+        list[Path] | None,
+        typer.Option(
+            "--current-summary-xlsx",
+            help="Current-round completed simulation summary XLSX. May be repeated.",
+        ),
+    ] = None,
+    current_history_csv: Annotated[
+        Path | None,
+        typer.Option("--current-history-csv", help="Current calibration history CSV."),
+    ] = None,
+    output_root: Annotated[
+        Path,
+        typer.Option(
+            "--output-root",
+            help="Directory for calibration manifests, history, candidate CSVs, and XLSX.",
+        ),
+    ] = Path("runs/compression_strength_calibration"),
+    case_id: Annotated[
+        list[str] | None,
+        typer.Option("--case-id", help="Restrict planning to a case id. May be repeated."),
+    ] = None,
+    batch_size: Annotated[
+        int, typer.Option("--batch-size", help="Maximum new candidates in each batch.")
+    ] = DEFAULT_CALIBRATION_BATCH_SIZE,
+    max_new_attempts: Annotated[
+        int, typer.Option("--max-new-attempts", help="Maximum new simulations per case.")
+    ] = DEFAULT_MAX_NEW_ATTEMPTS,
+    max_batches: Annotated[
+        int, typer.Option("--max-batches", help="Maximum adaptive batches to execute.")
+    ] = 1,
+    execute: Annotated[
+        bool,
+        typer.Option(
+            "--execute",
+            help="Prepare, datacheck, run, record history, and archive ODBs.",
+        ),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Use pipeline dry-run submission paths; no Abaqus solve."),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Overwrite existing prepared batch dirs."),
+    ] = False,
+    batch_id: Annotated[str | None, typer.Option("--batch-id", help="Batch id prefix.")] = None,
+    archive_root: Annotated[
+        Path,
+        typer.Option("--archive-root", help="Archive root, normally on E: drive."),
+    ] = Path("E:/ZDYF_NBY_abqbatch_archive"),
+    no_archive: Annotated[
+        bool,
+        typer.Option("--no-archive", help="Do not archive ODBs after executed batches."),
+    ] = False,
+    reference_angle_deg: Annotated[
+        float,
+        typer.Option(
+            "--reference-angle-deg",
+            help="Default angle for legacy reference summaries without an angle column.",
+        ),
+    ] = 0.8,
+    reference_g1c: Annotated[
+        float,
+        typer.Option(
+            "--reference-g1c",
+            help="Default G1C for legacy reference summaries without a G1C column.",
+        ),
+    ] = 5.0,
+) -> None:
+    """Plan or execute adaptive compression calibration batches."""
+
+    if target_xlsx.name.startswith("~$"):
+        raise typer.BadParameter("Use the real target workbook, not an Excel lock file")
+    if max_batches < 1:
+        raise typer.BadParameter("--max-batches must be at least 1")
+    if execute and params_json is None:
+        raise typer.BadParameter("--params-json is required with --execute")
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    history_csv = current_history_csv or (output_root / "calibration_history.csv")
+    targets = parse_strength_targets(target_xlsx)
+    reference_records: list[dict[str, Any]] = []
+    for summary in reference_summary_xlsx or []:
+        reference_records.extend(
+            parse_sim_summary_xlsx(
+                summary,
+                data_role=REFERENCE_SIM,
+                default_angle_deg=reference_angle_deg,
+                default_g1c=reference_g1c,
+            )
+        )
+    current_summary_records: list[dict[str, Any]] = []
+    for summary in current_summary_xlsx or []:
+        current_summary_records.extend(
+            parse_sim_summary_xlsx(
+                summary,
+                data_role=CURRENT_SIM,
+                default_angle_deg=None,
+                default_g1c=None,
+            )
+        )
+
+    batch_prefix = batch_id or f"calibration_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    last_plan: dict[str, Any] | None = None
+    paths: dict[str, Path] | None = None
+    executed_batches = 0
+    for batch_index in range(1, max_batches + 1):
+        sim_records = list(reference_records) + list(current_summary_records)
+        sim_records.extend(read_calibration_history(history_csv))
+        this_batch_id = batch_prefix if max_batches == 1 else f"{batch_prefix}_b{batch_index:02d}"
+        plan = build_calibration_plan(
+            targets,
+            sim_records,
+            case_ids=set(case_id) if case_id else None,
+            batch_size=batch_size,
+            max_new_attempts=max_new_attempts,
+        )
+        plan.update(
+            {
+                "batch_id": this_batch_id,
+                "batch_index": batch_index,
+                "target_xlsx": str(target_xlsx),
+                "reference_summary_xlsx": [str(path) for path in reference_summary_xlsx or []],
+                "current_summary_xlsx": [str(path) for path in current_summary_xlsx or []],
+                "current_history_csv": str(history_csv),
+                "params_json": str(params_json) if params_json else None,
+                "execute": execute,
+                "dry_run": dry_run,
+                "data_roles": {
+                    "targets": TARGET_ONLY,
+                    "reference_summaries": REFERENCE_SIM,
+                    "current_summaries": CURRENT_SIM,
+                    "current_history": CURRENT_SIM,
+                },
+            }
+        )
+        paths = write_calibration_outputs(output_root, plan, targets, sim_records)
+        last_plan = plan
+        if not execute or not plan["candidates"]:
+            break
+        archive_target = None if no_archive or dry_run else archive_root
+        execution = run_calibration_batch(
+            params_json=params_json or Path(),
+            candidates=plan["candidates"],
+            output_root=output_root,
+            batch_id=this_batch_id,
+            history_csv=history_csv,
+            archive_root=archive_target,
+            dry_run=dry_run,
+            force=force,
+        )
+        executed_batches += 1
+        plan["execution"] = execution
+        sim_records.extend(execution["history_rows"])
+        paths = write_calibration_outputs(output_root, plan, targets, sim_records)
+
+    if last_plan is None or paths is None:
+        raise typer.Exit(1)
+    message = (
+        f"Planned {last_plan['candidate_count']} candidates from "
+        f"{last_plan['active_target_count']} active targets and "
+        f"{last_plan['simulation_point_count']} simulation points."
+    )
+    typer.echo(message)
+    if execute:
+        typer.echo(f"Executed batches: {executed_batches}")
+        typer.echo(f"History CSV: {history_csv}")
+    typer.echo(f"Manifest: {paths['manifest']}")
+    typer.echo(f"Candidates: {paths['candidates_csv']}")
+    typer.echo(f"Summary XLSX: {paths['xlsx']}")
+
+
+@app.command("archive-odb")
+def archive_odb_command(
+    run_dir: Annotated[
+        Path, typer.Option("--run-dir", help="Run directory containing ODB files to archive.")
+    ],
+    batch_id: Annotated[
+        str, typer.Option("--batch-id", help="Calibration batch id for the archive index.")
+    ],
+    archive_root: Annotated[
+        Path,
+        typer.Option("--archive-root", help="Archive root, normally on E: drive."),
+    ] = Path("E:/ZDYF_NBY_abqbatch_archive"),
+    index_dir: Annotated[
+        Path | None,
+        typer.Option("--index-dir", help="D-drive directory for a copy of the archive index."),
+    ] = None,
+    attempts_csv: Annotated[
+        Path | None,
+        typer.Option(
+            "--attempts-csv",
+            help="CSV carrying case_id/attempt_id/angle_deg/g1c/job_name metadata.",
+        ),
+    ] = None,
+) -> None:
+    """Move ODB files to the archive root and write D/E index CSVs."""
+
+    attempt_rows: list[dict[str, Any]] = []
+    if attempts_csv is not None and attempts_csv.exists():
+        with attempts_csv.open("r", encoding="utf-8-sig", newline="") as stream:
+            attempt_rows = list(csv.DictReader(stream))
+    result = archive_odb_files(
+        run_dir,
+        archive_root=archive_root,
+        index_dir=index_dir or (run_dir / "reports"),
+        batch_id=batch_id,
+        attempt_rows=attempt_rows,
+    )
+    typer.echo(f"Archived {result['archived_count']} ODB files to {result['archive_dir']}")
+    typer.echo(f"D index: {result['d_index']}")
+    typer.echo(f"Archive index: {result['e_index']}")
 
 
 @app.command("prepare")

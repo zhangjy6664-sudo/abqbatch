@@ -1,10 +1,28 @@
 from __future__ import annotations
 
+import csv
 import json
 import zipfile
 from pathlib import Path
 
-from abqbatch.meso_compression import prepare_batch, write_results_xlsx
+import pytest
+
+import abqbatch.meso_compression as meso_compression
+from abqbatch.meso_compression import (
+    CURRENT_SIM,
+    REFERENCE_SIM,
+    TARGET_ONLY,
+    archive_odb_files,
+    parse_sim_summary_xlsx,
+    parse_strength_targets,
+    prepare_batch,
+    prepare_calibration_candidate,
+    run_calibration_batch,
+    select_strength_candidate,
+    strength_error_pct,
+    write_results_xlsx,
+    write_xlsx,
+)
 
 
 def _sample_params(root: Path) -> dict:
@@ -229,3 +247,309 @@ def test_results_xlsx_is_written(workspace_tmp: Path) -> None:
         names = set(archive.namelist())
     assert "xl/workbook.xml" in names
     assert "xl/worksheets/sheet1.xml" in names
+
+
+def test_strength_target_parser_is_target_only_and_marks_exclusions(workspace_tmp: Path) -> None:
+    target_xlsx = workspace_tmp / "targets.xlsx"
+    write_xlsx(
+        target_xlsx,
+        {
+            "Sheet1": [
+                ["group", "dim_a", "dim_b", "ignored", "compression_strength"],
+                [0, 12, 24, 999, 300.0],
+                [1, 24, 24, 999, 220.0],
+                [2, 48, 72, 999, 500.0],
+            ]
+        },
+    )
+
+    targets = parse_strength_targets(target_xlsx)
+
+    assert [row["case_id"] for row in targets] == ["QJ-12-24", "13-24-24", "132-48-72"]
+    assert {row["data_role"] for row in targets} == {TARGET_ONLY}
+    assert targets[0]["target_strength_mpa"] == 300.0
+    assert targets[1]["excluded"] is True
+    assert targets[2]["source_inp"].endswith("132-48-72-jq.inp")
+
+
+def test_sim_summary_parser_outputs_only_actual_sim_points(workspace_tmp: Path) -> None:
+    summary_xlsx = workspace_tmp / "summary.xlsx"
+    write_xlsx(
+        summary_xlsx,
+        {
+            "all_cases_summary": [
+                ["case_id", "status", "job_name", "compressive_strength_mpa"],
+                ["13-12-24", "SOLVED", "mc_13_12_24_puckzt_angle_0p8_g1c5", 180.0],
+                ["13-24-24", "DATACHECK_FAILED", "mc_13_24_24_puckzt_angle_0p8_g1c5", None],
+            ]
+        },
+    )
+
+    records = parse_sim_summary_xlsx(summary_xlsx, data_role=REFERENCE_SIM)
+
+    assert len(records) == 1
+    assert records[0]["data_role"] == REFERENCE_SIM
+    assert records[0]["case_id"] == "13-12-24"
+    assert records[0]["angle_deg"] == 0.8
+    assert records[0]["g1c"] == 5.0
+    assert records[0]["compressive_strength_mpa"] == 180.0
+
+
+def test_interpolator_rejects_target_only_records() -> None:
+    target = {
+        "data_role": TARGET_ONLY,
+        "case_id": "13-12-24",
+        "case_key": "13-12-24",
+        "target_strength_mpa": 100.0,
+    }
+
+    with pytest.raises(ValueError, match="non-simulation"):
+        select_strength_candidate(target, [target])
+
+
+def test_out_of_bounds_reference_does_not_accept_case() -> None:
+    target = {
+        "data_role": TARGET_ONLY,
+        "case_id": "13-12-24",
+        "case_key": "13-12-24",
+        "target_strength_mpa": 100.0,
+    }
+    sim_records = [
+        {
+            "data_role": REFERENCE_SIM,
+            "case_id": "13-12-24",
+            "case_key": "13-12-24",
+            "angle_deg": 0.8,
+            "g1c": 5.0,
+            "compressive_strength_mpa": 102.0,
+        }
+    ]
+
+    decision = select_strength_candidate(target, sim_records)
+
+    assert decision["status"] == "planned"
+    assert decision["angle_deg"] >= 1.0
+
+
+def test_strength_candidate_uses_simulation_bracket() -> None:
+    target = {
+        "data_role": TARGET_ONLY,
+        "case_id": "13-12-24",
+        "case_key": "13-12-24",
+        "target_strength_mpa": 100.0,
+    }
+    sim_records = [
+        {
+            "data_role": REFERENCE_SIM,
+            "case_id": "13-12-24",
+            "case_key": "13-12-24",
+            "angle_deg": 1.0,
+            "g1c": 5.0,
+            "compressive_strength_mpa": 120.0,
+        },
+        {
+            "data_role": CURRENT_SIM,
+            "case_id": "13-12-24",
+            "case_key": "13-12-24",
+            "angle_deg": 3.0,
+            "g1c": 5.0,
+            "compressive_strength_mpa": 80.0,
+        },
+    ]
+
+    decision = select_strength_candidate(target, sim_records)
+
+    assert decision["status"] == "planned"
+    assert decision["reason"] == "same_g1c_strength_bracket"
+    assert decision["angle_deg"] == 2.0
+    assert decision["g1c"] == 5.0
+    assert decision["planned_data_role"] == CURRENT_SIM
+
+
+def test_strength_error_uses_target_denominator() -> None:
+    assert strength_error_pct(target_strength_mpa=200.0, simulated_strength_mpa=170.0) == 15.0
+
+
+def test_archive_odb_files_moves_odb_and_writes_indexes(workspace_tmp: Path) -> None:
+    run_dir = workspace_tmp / "run"
+    case_dir = run_dir / "work" / "cases" / "13-12-24"
+    case_dir.mkdir(parents=True)
+    odb = case_dir / "mc_13_12_24_attempt1.odbprobe"
+    odb.write_bytes(b"fake odb bytes")
+    archive_root = workspace_tmp / "archive_root"
+    index_dir = run_dir / "reports"
+    attempt_rows = [
+        {
+            "job_name": "mc_13_12_24_attempt1",
+            "case_id": "13-12-24",
+            "attempt_id": "1",
+            "angle_deg": "2.0",
+            "g1c": "5.0",
+        }
+    ]
+
+    moved_sources: list[Path] = []
+
+    def fake_move(src: Path, dst: Path) -> None:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(src.read_bytes())
+        moved_sources.append(src)
+
+    result = archive_odb_files(
+        run_dir,
+        archive_root=archive_root,
+        index_dir=index_dir,
+        batch_id="batch_001",
+        attempt_rows=attempt_rows,
+        stamp="20260701_120000",
+        file_glob="*.odbprobe",
+        move_file=fake_move,
+    )
+
+    assert result["archived_count"] == 1
+    assert moved_sources == [odb]
+    assert Path(result["d_index"]).exists()
+    assert Path(result["e_index"]).exists()
+    with Path(result["d_index"]).open("r", encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert rows[0]["case_id"] == "13-12-24"
+    assert rows[0]["attempt_id"] == "1"
+    assert rows[0]["size_bytes"] == str(len(b"fake odb bytes"))
+    assert len(rows[0]["sha256"]) == 64
+    assert Path(rows[0]["archive_path"]).exists()
+
+
+
+def _write_angle_umat(path: Path) -> None:
+    path.write_text(
+        "      SUBROUTINE UMAT()\n"
+        "      ANGLE_INI=0.8/180.*3.141592654\n"
+        "C     ANGLE_INI=abs(STATEV(8))/180.*3.141592654\n"
+        "      END\n",
+        encoding="utf-8",
+    )
+
+
+def test_prepare_calibration_candidate_patches_params_umat_and_source(workspace_tmp: Path) -> None:
+    params = _sample_params(workspace_tmp)
+    _write_angle_umat(workspace_tmp / "umat.for")
+    params_path = workspace_tmp / "params.json"
+    params_path.write_text(json.dumps(params), encoding="utf-8")
+    source = workspace_tmp / "132-48-72-jq.inp"
+    source.write_text(
+        _sample_inp('*Boundary\n"Constraints Driver Fx", 1, 1, 0.06'),
+        encoding="utf-8",
+    )
+    candidate = {
+        "batch_slot": 1,
+        "case_id": "132-48-72",
+        "case_key": "132-48-72",
+        "source_inp": str(source),
+        "attempt_id": 1,
+        "angle_deg": 2.5,
+        "g1c": 80.0,
+        "target_strength_mpa": 300.0,
+    }
+
+    prepared = prepare_calibration_candidate(
+        params_json=params_path,
+        candidate=candidate,
+        batch_dir=workspace_tmp / "batch",
+    )
+
+    manifest = prepared["manifest"]
+    assert manifest["cases"][0]["case_id"] == "132-48-72"
+    assert manifest["materials"]["WARP"]["constants"]["G1C"] == 80.0
+    generated_params = json.loads(Path(prepared["params_json"]).read_text(encoding="utf-8"))
+    assert generated_params["candidate_parameters"]["fiber_angle_deg"] == 2.5
+    assert generated_params["materials"]["WEFT"]["constants"]["G1C"] == 80.0
+    umat_text = Path(generated_params["umat"]["working_copy"]).read_text(encoding="utf-8")
+    assert "ANGLE_INI=2.5/180.*3.141592654" in umat_text
+    canonical_source = Path(prepared["attempt_dir"]) / "source_inp" / "132-48-72.inp"
+    assert canonical_source.exists()
+
+
+def test_run_calibration_batch_updates_history_and_archives(
+    workspace_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    params = _sample_params(workspace_tmp)
+    _write_angle_umat(workspace_tmp / "umat.for")
+    params_path = workspace_tmp / "params.json"
+    params_path.write_text(json.dumps(params), encoding="utf-8")
+    input_source = workspace_tmp / "13-12-24.inp"
+    input_source.write_text(
+        _sample_inp('*Boundary\n"Constraints Driver Fx", 1, 1, 0.06'),
+        encoding="utf-8",
+    )
+    candidate = {
+        "batch_slot": 1,
+        "case_id": "13-12-24",
+        "case_key": "13-12-24",
+        "source_inp": str(input_source),
+        "attempt_id": 1,
+        "angle_deg": 2.0,
+        "g1c": 40.0,
+        "target_strength_mpa": 200.0,
+    }
+
+    def fake_datacheck(run_dir: Path, *, case_ids=None, dry_run: bool = False):
+        del case_ids, dry_run
+        manifest = meso_compression.load_manifest(run_dir)
+        case = manifest["cases"][0]
+        state = meso_compression.read_case_state(case)
+        state["status"] = "DATACHECKED"
+        meso_compression.write_case_state(case, state)
+        return [state]
+
+    def fake_analysis(run_dir: Path, *, case_ids=None, dry_run: bool = False):
+        del case_ids, dry_run
+        manifest = meso_compression.load_manifest(run_dir)
+        case = manifest["cases"][0]
+        summary = {
+            "metrics": {"compressive_strength_mpa": 185.0},
+            "curve": {"point_count": 12},
+        }
+        meso_compression._write_json(Path(case["summary_json"]), summary)
+        state = meso_compression.read_case_state(case)
+        state.update({"status": "SOLVED", "metrics": summary["metrics"], "curve": summary["curve"]})
+        meso_compression.write_case_state(case, state)
+        return [state]
+
+    archive_calls: list[dict] = []
+
+    def fake_archive(run_dir: Path, **kwargs):
+        archive_calls.append({"run_dir": run_dir, **kwargs})
+        archive_root = kwargs["archive_root"]
+        index_dir = kwargs["index_dir"]
+        return {
+            "archive_dir": archive_root / "fake",
+            "d_index": index_dir / "fake.csv",
+            "e_index": archive_root / "fake" / "fake.csv",
+            "archived_count": 0,
+        }
+
+    monkeypatch.setattr(meso_compression, "datacheck_cases", fake_datacheck)
+    monkeypatch.setattr(meso_compression, "analysis_cases", fake_analysis)
+    monkeypatch.setattr(meso_compression, "archive_odb_files", fake_archive)
+
+    history_csv = workspace_tmp / "history.csv"
+    result = run_calibration_batch(
+        params_json=params_path,
+        candidates=[candidate],
+        output_root=workspace_tmp / "calibration",
+        batch_id="batch_001",
+        history_csv=history_csv,
+        archive_root=workspace_tmp / "archive",
+    )
+
+    assert result["history_rows"][0]["data_role"] == CURRENT_SIM
+    assert result["history_rows"][0]["compressive_strength_mpa"] == 185.0
+    assert result["history_rows"][0]["error_pct"] == 7.5
+    assert result["history_rows"][0]["accepted"] is True
+    assert archive_calls[0]["batch_id"] == "batch_001"
+    assert archive_calls[0]["attempt_rows"][0]["job_name"].startswith("mc_13_12_24_cal_a2")
+    with history_csv.open("r", encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert rows[0]["data_role"] == CURRENT_SIM
+    assert rows[0]["case_id"] == "13-12-24"
+    assert rows[0]["compressive_strength_mpa"] == "185.0"
