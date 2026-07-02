@@ -2020,6 +2020,141 @@ def _dict_sheet(rows: list[dict[str, Any]], headers: list[str] | None = None) ->
     return [headers] + [[row.get(header) for header in headers] for row in rows]
 
 
+def _count_by(rows: Iterable[dict[str, Any]], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        value = str(row.get(key) or "unknown")
+        counts[value] = counts.get(value, 0) + 1
+    return counts
+
+
+def _calibration_overview_sheet(
+    plan: dict[str, Any],
+    targets: list[dict[str, Any]],
+    sim_records: list[dict[str, Any]],
+    archive_rows: list[dict[str, Any]],
+) -> list[list[Any]]:
+    status_counts = _count_by(plan.get("decisions", []), "status")
+    sim_role_counts = _count_by(sim_records, "data_role")
+    excluded_count = sum(1 for target in targets if target.get("excluded"))
+    archived_bytes = sum(_coerce_int(row.get("size_bytes")) or 0 for row in archive_rows)
+    rows = [
+        ["metric", "value"],
+        ["created_at", plan.get("created_at")],
+        ["pipeline_version", plan.get("pipeline_version")],
+        ["batch_id", plan.get("batch_id")],
+        ["plan_phase", plan.get("plan_phase")],
+        ["last_executed_batch_id", plan.get("last_executed_batch_id")],
+        ["target_count", plan.get("target_count")],
+        ["active_target_count", plan.get("active_target_count")],
+        ["excluded_target_count", excluded_count],
+        ["simulation_point_count", plan.get("simulation_point_count")],
+        ["reference_sim_points", sim_role_counts.get(REFERENCE_SIM, 0)],
+        ["current_sim_points", sim_role_counts.get(CURRENT_SIM, 0)],
+        ["accepted_cases", status_counts.get("accepted", 0)],
+        ["planned_cases", status_counts.get("planned", 0)],
+        ["max_attempts_reached_cases", status_counts.get("max_attempts_reached", 0)],
+        ["next_candidate_count", plan.get("candidate_count")],
+        ["acceptance_error_pct", ACCEPTANCE_ERROR_PCT],
+        ["angle_range_deg", f"{ANGLE_MIN_DEG:g}-{ANGLE_MAX_DEG:g}"],
+        ["g1c_range", f"{G1C_MIN:g}-{G1C_MAX:g}"],
+        ["archive_odb_count", len(archive_rows)],
+        ["archive_total_bytes", archived_bytes],
+    ]
+    return rows
+
+
+def _calibration_status_summary_sheet(
+    plan: dict[str, Any],
+    targets: list[dict[str, Any]],
+    sim_records: list[dict[str, Any]],
+) -> list[list[Any]]:
+    rows: list[list[Any]] = [["category", "name", "count"]]
+    for status, count in sorted(_count_by(plan.get("decisions", []), "status").items()):
+        rows.append(["decision_status", status, count])
+    for role, count in sorted(_count_by(targets, "data_role").items()):
+        rows.append(["target_data_role", role, count])
+    for role, count in sorted(_count_by(sim_records, "data_role").items()):
+        rows.append(["simulation_data_role", role, count])
+    excluded_count = sum(1 for target in targets if target.get("excluded"))
+    rows.append(["target_scope", "excluded", excluded_count])
+    rows.append(["target_scope", "active", plan.get("active_target_count")])
+    return rows
+
+
+def _read_calibration_archive_rows(output_root: Path) -> list[dict[str, Any]]:
+    archive_dir = output_root / "archive_indexes"
+    if not archive_dir.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for index_csv in sorted(archive_dir.glob("*_odb_archive_index.csv")):
+        with index_csv.open("r", encoding="utf-8-sig", newline="") as stream:
+            for row in csv.DictReader(stream):
+                enriched = dict(row)
+                enriched["index_csv"] = str(index_csv)
+                rows.append(enriched)
+    return rows
+
+
+def _archive_batch_dir(archive_path_text: str, batch_id: str) -> str:
+    archive_path = Path(archive_path_text)
+    parts = archive_path.parts
+    if batch_id in parts:
+        return str(Path(*parts[: parts.index(batch_id) + 1]))
+    return str(archive_path.parent)
+
+
+def _calibration_archive_summary_sheet(archive_rows: list[dict[str, Any]]) -> list[list[Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in archive_rows:
+        batch_id = str(row.get("batch_id") or "unknown")
+        item = grouped.setdefault(
+            batch_id,
+            {
+                "batch_id": batch_id,
+                "odb_count": 0,
+                "total_size_bytes": 0,
+                "missing_metadata_rows": 0,
+                "case_ids": set(),
+                "archive_dir": None,
+            },
+        )
+        item["odb_count"] += 1
+        item["total_size_bytes"] += _coerce_int(row.get("size_bytes")) or 0
+        if row.get("case_id"):
+            item["case_ids"].add(str(row["case_id"]))
+        if not all(row.get(key) for key in ("case_id", "attempt_id", "angle_deg", "g1c", "sha256")):
+            item["missing_metadata_rows"] += 1
+        archive_path = str(row.get("archive_path") or "")
+        if archive_path and item["archive_dir"] is None:
+            item["archive_dir"] = _archive_batch_dir(archive_path, batch_id)
+    headers = [
+        "batch_id",
+        "odb_count",
+        "case_count",
+        "case_ids",
+        "total_size_bytes",
+        "missing_metadata_rows",
+        "archive_dir",
+    ]
+    body = []
+    for batch_id in sorted(grouped):
+        item = grouped[batch_id]
+        case_ids = sorted(item["case_ids"])
+        body.append(
+            [
+                item["batch_id"],
+                item["odb_count"],
+                len(case_ids),
+                ",".join(case_ids),
+                item["total_size_bytes"],
+                item["missing_metadata_rows"],
+                item["archive_dir"],
+            ]
+        )
+    return [headers] + body
+
+
 def write_calibration_outputs(
     output_root: Path,
     plan: dict[str, Any],
@@ -2046,10 +2181,39 @@ def write_calibration_outputs(
         writer = csv.DictWriter(stream, fieldnames=candidate_headers, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(plan["candidates"])
+    archive_rows = _read_calibration_archive_rows(output_root)
+    accepted_headers = [
+        "case_id",
+        "target_strength_mpa",
+        "best_error_pct",
+        "accepted_source_role",
+        "accepted_angle_deg",
+        "accepted_g1c",
+        "reason",
+    ]
+    max_attempt_headers = [
+        "case_id",
+        "target_strength_mpa",
+        "current_attempts",
+        "best_error_pct",
+        "reason",
+    ]
     write_xlsx(
         xlsx_path,
         {
+            "overview": _calibration_overview_sheet(plan, targets, sim_records, archive_rows),
+            "status_summary": _calibration_status_summary_sheet(plan, targets, sim_records),
             "next_candidates": _dict_sheet(plan["candidates"], candidate_headers),
+            "accepted_cases": _dict_sheet(
+                [row for row in plan["decisions"] if row.get("status") == "accepted"],
+                accepted_headers,
+            ),
+            "max_attempts": _dict_sheet(
+                [row for row in plan["decisions"] if row.get("status") == "max_attempts_reached"],
+                max_attempt_headers,
+            ),
+            "archive_summary": _calibration_archive_summary_sheet(archive_rows),
+            "archive_index": _dict_sheet(archive_rows),
             "decisions": _dict_sheet(plan["decisions"]),
             "targets": _dict_sheet(targets),
             "simulation_points": _dict_sheet(sim_records),

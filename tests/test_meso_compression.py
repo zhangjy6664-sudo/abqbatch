@@ -17,6 +17,7 @@ from abqbatch.meso_compression import (
     parse_strength_targets,
     prepare_batch,
     prepare_calibration_candidate,
+    read_xlsx_rows,
     run_calibration_batch,
     select_strength_candidate,
     strength_error_pct,
@@ -628,4 +629,125 @@ def test_calibrate_strength_refreshes_next_candidates_after_execution(
     manifest = json.loads((output_root / "calibration_manifest.json").read_text(encoding="utf-8"))
     assert manifest["plan_phase"] == "post_execution_next_batch"
     assert manifest["last_executed_batch_id"] == "batch_001"
+
+
+def test_calibration_summary_xlsx_includes_status_and_archive_sheets(workspace_tmp: Path) -> None:
+    output_root = workspace_tmp / "calibration"
+    archive_index_dir = output_root / "archive_indexes"
+    archive_index_dir.mkdir(parents=True)
+    archive_index = archive_index_dir / "batch_001_odb_archive_index.csv"
+    with archive_index.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=[
+                "archived_at",
+                "batch_id",
+                "case_id",
+                "attempt_id",
+                "angle_deg",
+                "g1c",
+                "original_path",
+                "archive_path",
+                "size_bytes",
+                "sha256",
+                "job_name",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "archived_at": "2026-07-02T10:00:00",
+                "batch_id": "batch_001",
+                "case_id": "13-12-12",
+                "attempt_id": "1",
+                "angle_deg": "3.0",
+                "g1c": "5.0",
+                "original_path": r"D:\work\job.odb",
+                "archive_path": r"E:\archive\job.odb",
+                "size_bytes": "128",
+                "sha256": "a" * 64,
+                "job_name": "job",
+            }
+        )
+    plan = {
+        "created_at": "2026-07-02T10:00:00",
+        "pipeline_version": "test",
+        "target_count": 3,
+        "active_target_count": 2,
+        "simulation_point_count": 2,
+        "batch_size": 1,
+        "candidate_count": 1,
+        "batch_id": "batch_002",
+        "plan_phase": "pre_execution",
+        "last_executed_batch_id": "batch_001",
+        "candidates": [
+            {
+                "batch_slot": 1,
+                "case_id": "13-12-24",
+                "attempt_id": 1,
+                "angle_deg": 3.0,
+                "g1c": 5.0,
+                "target_strength_mpa": 200.0,
+                "planned_data_role": CURRENT_SIM,
+                "reason": "explore",
+                "source_inp": "13-inp/13-12-24.inp",
+            }
+        ],
+        "decisions": [
+            {
+                "status": "accepted",
+                "case_id": "13-12-12",
+                "target_strength_mpa": 100.0,
+                "best_error_pct": 2.0,
+                "accepted_source_role": REFERENCE_SIM,
+                "accepted_angle_deg": 0.8,
+                "accepted_g1c": 5.0,
+                "reason": "simulation_within_error_limit",
+            },
+            {
+                "status": "planned",
+                "case_id": "13-12-24",
+                "target_strength_mpa": 200.0,
+                "attempt_id": 1,
+                "angle_deg": 3.0,
+                "g1c": 5.0,
+                "reason": "explore",
+            },
+            {
+                "status": "max_attempts_reached",
+                "case_id": "13-12-36",
+                "target_strength_mpa": 300.0,
+                "current_attempts": 3,
+                "best_error_pct": 20.0,
+                "reason": "max_new_attempts_reached_without_acceptance",
+            },
+        ],
+    }
+    targets = [
+        {"data_role": TARGET_ONLY, "case_id": "13-12-12", "excluded": False},
+        {"data_role": TARGET_ONLY, "case_id": "13-12-24", "excluded": False},
+        {"data_role": TARGET_ONLY, "case_id": "13-24-24", "excluded": True},
+    ]
+    sim_records = [
+        {"data_role": REFERENCE_SIM, "case_id": "13-12-12", "compressive_strength_mpa": 102.0},
+        {"data_role": CURRENT_SIM, "case_id": "13-12-24", "compressive_strength_mpa": 180.0},
+    ]
+
+    paths = meso_compression.write_calibration_outputs(output_root, plan, targets, sim_records)
+
+    overview = dict(read_xlsx_rows(paths["xlsx"], sheet_name="overview")[1:])
+    assert overview["accepted_cases"] == 1
+    assert overview["planned_cases"] == 1
+    assert overview["max_attempts_reached_cases"] == 1
+    assert overview["archive_odb_count"] == 1
+    assert overview["archive_total_bytes"] == 128
+    status_rows = read_xlsx_rows(paths["xlsx"], sheet_name="status_summary")
+    assert ["decision_status", "max_attempts_reached", 1] in status_rows
+    assert ["simulation_data_role", CURRENT_SIM, 1] in status_rows
+    assert read_xlsx_rows(paths["xlsx"], sheet_name="max_attempts")[1][0] == "13-12-36"
+    archive_summary = read_xlsx_rows(paths["xlsx"], sheet_name="archive_summary")
+    assert archive_summary[0][-1] == "archive_dir"
+    assert archive_summary[1][0] == "batch_001"
+    assert archive_summary[1][1] == 1
+    assert archive_summary[1][4] == 128
 
