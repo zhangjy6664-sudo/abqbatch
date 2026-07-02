@@ -1,357 +1,303 @@
 # Codex Simulation Handoff
 
-This document is for the Codex instance on another Windows workstation that will take over or audit the Abaqus meso compression and shear simulations.
+This document is for a Codex instance on another Windows workstation taking over the Abaqus meso compression calibration work.
 
-Last updated: 2026-07-01, Asia/Shanghai.
+Last updated: 2026-07-02 18:50 Asia/Shanghai.
 
-## Current Repository State
+## Current State
 
-- Repository: `https://github.com/zhangjy6664-sudo/abqbatch.git`
-- Working branch to continue from: `codex/meso-compression-batch-pipeline`
-- Latest relevant commits:
-  - `Add meso shear batch workflow`
-  - `9735c6b Add original meso inp decks`
-  - `3df3ca0 Add meso compression batch pipeline`
-- The raw source decks are committed through Git LFS:
-  - `13-inp/`: 35 raw `.inp`
-  - `132/`: 36 raw `.inp`
-  - `qj/`: 36 raw `.inp`
-- Do not use or commit `runs/` as source input. It is run state and reports only.
+- Repository branch: `codex/meso-compression-batch-pipeline`.
+- Latest local commits on this branch:
+  - `916b9db Add calibration status workbook sheets`
+  - `b6ef78b Refresh calibration plan after executed batches`
+  - `ec2b12a Accept qualifying reference compression results`
+  - `c717379 Add adaptive compression calibration execution`
+- These commits may still be local-only on the original machine unless the user explicitly approves pushing to the remote.
+- Current calibration output root: `D:\ZDYF_NBY\abqbatch\runs\compression_strength_calibration`.
+- Current manifest: `runs\compression_strength_calibration\calibration_manifest.json`.
+- Current workbook: `runs\compression_strength_calibration\calibration_summary.xlsx`.
+- Current next-candidate CSV: `runs\compression_strength_calibration\next_candidates.csv`.
+- Current plan phase: `pre_execution` for `calibration_20260702_batch_07`.
+- Current status counts from `calibration_summary.xlsx`: accepted `58`, max-attempts `7`, planned `39`.
+- Simulation points: `REFERENCE_SIM=105`, `CURRENT_SIM=37`, total `142`.
+- Targets: total `107`, active `104`, excluded `3`.
+- Archived calibration ODB count so far: `74`.
+- D-drive calibration batch directories currently have no `.odb` residuals after batch 06.
+- No Abaqus solver should be running before takeover. Check again before submitting anything.
 
-## Clone On The New Machine
+The previous Codex was told to stop after batch 06. Do not start batch 07 unless the user explicitly authorizes it in the active thread.
 
-Run this from the target parent directory:
+## Data Source Contract
 
-```powershell
-git lfs install
-git clone --branch codex/meso-compression-batch-pipeline https://github.com/zhangjy6664-sudo/abqbatch.git D:\ZDYF_NBY\abqbatch
-Set-Location D:\ZDYF_NBY\abqbatch
-git lfs pull
-python -m pip install -e ".[dev]"
+The calibration has strict source separation.
+
+- Target strength source: `D:\ZDYF_NBY\静强度数据集.xlsx`, Sheet1, column 5. This is `TARGET_ONLY`.
+- Previous-round actual simulation reference: `D:\ZDYF_NBY\abqbatch\runs\puckzt_angle_0p8_g1c5_compression_all\reports\meso_compression_all_batches_summary.xlsx`. This is `REFERENCE_SIM`.
+- Current calibration history: `D:\ZDYF_NBY\abqbatch\runs\compression_strength_calibration\calibration_history.csv`. This is `CURRENT_SIM`.
+- The target workbook must never be used as an interpolation or trend source.
+- Interpolation may only use `REFERENCE_SIM` and `CURRENT_SIM` records.
+- Error and acceptance are computed against `TARGET_ONLY` only.
+- Acceptance criterion: absolute relative strength error `<=15%`.
+- Old `REFERENCE_SIM` points are accepted directly if they already satisfy `<=15%`, even if their angle is outside the new candidate range.
+
+Excluded from continuing calibration:
+
+```text
+qj-24-24
+13-24-24
+13-24-48
+13-24-72
 ```
 
-Verify that LFS fetched the real decks, not pointer-only files:
+Special source deck rule:
 
-```powershell
-Get-ChildItem 13-inp,132,qj -Filter *.inp | Measure-Object Length -Sum
-git lfs ls-files | Measure-Object
+```text
+132-48-72 uses D:\ZDYF-NBY-ZJY\资料\inp\inp统计-JQ\inp统计-JQ\132-48-72-jq.inp
 ```
 
-Expected deck count: `107`.
+## Batch 07 Candidates
+
+The next planned batch is `calibration_20260702_batch_07`.
+
+```text
+slot  case_id   attempt  angle_deg  g1c  target_strength_mpa  reason
+1     13-60-60  3        2.0        5.0  159.13               nearest_sim_above_target_reduce_strength
+2     13-60-72  3        2.0        5.0  140.62               nearest_sim_above_target_reduce_strength
+3     13-72-36  3        2.0        5.0  195.35               nearest_sim_above_target_reduce_strength
+4     13-72-48  2        2.5        5.0  164.17               nearest_sim_above_target_reduce_strength
+5     13-72-60  1        3.0        5.0  153.48               nearest_sim_above_target_reduce_strength
+6     13-72-72  1        3.0        5.0  145.53               nearest_sim_above_target_reduce_strength
+```
+
+The max-attempt cases already recorded before batch 07 are:
+
+```text
+13-36-60 best_error_pct=19.422904
+13-36-72 best_error_pct=35.360164
+13-48-36 best_error_pct=16.239895
+13-48-48 best_error_pct=31.978848
+13-48-72 best_error_pct=42.83314
+13-60-36 best_error_pct=23.941184
+13-60-48 best_error_pct=21.755236
+```
 
 ## Required External Inputs
 
-The parameter JSON and UMAT source are outside this repository. Copy them to the new machine or change the `--params-json` path and JSON UMAT paths consistently before preparing new runs.
-
-Required parameter JSON:
-
 ```text
+base params JSON:
 D:\ZDYF_NBY\13-24-24-YS-simulation\07_validation\meso_vs_experiment\compression\puckzt_angle_0p8_g1c5_input_parameters.json
-```
 
-Expected hashes:
-
-```text
-params_sha256=62a5fa3020e209b202343afbee858ccb634f816760b38b1ea1adc752aabc107c
-params_payload_sha256=f97f6a7efde9de96b72922ec3533cca19cb83de8f0ad4dfbb612cc8437bf0c3b
-umat_source_sha256=627ba062037a7a356fdd11ef66555c90b9fb39e48bd4c9d73e3e1f6ebd702f5b
-```
-
-UMAT path recorded in the completed manifests:
-
-```text
-D:\ZDYF_NBY\13-24-24-YS-simulation\05_meso_simulation\jobs\compression\umat_candidates\puckzt_angle_0p8_g1c5\puck_zt_current_matrix_candidate_001.for
-```
-
-## Abaqus Rules
-
-- Always call `C:\Users\11843\codex_abaqus.cmd`, never raw `abaqus`.
-- Run datacheck before analysis.
-- Run analyses serially.
-- Use `cpus=16` unless the user explicitly changes it.
-- Keep raw decks read-only. The pipeline copies and patches into `runs/.../work/cases/.../input/working.inp`.
-- Stop no-longer-needed jobs with:
-
-```powershell
-& 'C:\Users\11843\codex_abaqus.cmd' terminate job=<job_name>
-```
-
-Before starting a new production run, verify:
-
-```powershell
-Get-Process | Where-Object { $_.ProcessName -match 'standard|explicit|SMA|abaqus|python' }
-Get-ChildItem -Path runs -Recurse -Filter *.lck -File -ErrorAction SilentlyContinue
-```
-
-Only `ABAQUSLM` is expected to remain active when no job is running.
-
-## Meso Compression Pipeline Commands
-
-The command group is `abqbatch meso-compression`.
-
-Prepare a new run directory from a raw `.inp` directory:
-
-```powershell
-abqbatch meso-compression prepare `
-  --params-json "D:\ZDYF_NBY\13-24-24-YS-simulation\07_validation\meso_vs_experiment\compression\puckzt_angle_0p8_g1c5_input_parameters.json" `
-  --input-dir "D:\ZDYF_NBY\abqbatch\<raw_inp_dir>" `
-  --run-dir "D:\ZDYF_NBY\abqbatch\runs\<new_run_name>"
-```
-
-Run datacheck for all prepared cases:
-
-```powershell
-abqbatch meso-compression datacheck --run-dir "D:\ZDYF_NBY\abqbatch\runs\<new_run_name>"
-```
-
-After datacheck completes, start serial analysis:
-
-```powershell
-abqbatch meso-compression run --run-dir "D:\ZDYF_NBY\abqbatch\runs\<new_run_name>"
-```
-
-Generate the summary workbook:
-
-```powershell
-abqbatch meso-compression report-xlsx --run-dir "D:\ZDYF_NBY\abqbatch\runs\<new_run_name>"
-```
-
-Check status at any time:
-
-```powershell
-abqbatch meso-compression status --run-dir "D:\ZDYF_NBY\abqbatch\runs\<new_run_name>"
-```
-
-## What The Pipeline Patches
-
-For each raw deck, the pipeline preserves geometry, mesh, partitions, sections, equations, and orientation data. It patches only:
-
-- `MATRIX`, `WARP`, and `WEFT` material cards from the JSON.
-- `Step-1` increment/static controls.
-- Driver boundary displacement.
-- DAT node print output for `"Constraints Driver Fx"` with `U` and `RF`.
-- UMAT working copy into the case input directory.
-
-Material contract expected by the current UMAT:
-
-- `MATRIX`: `*Depvar` 11, `*User Material, constants=12`.
-- `WARP` / `WEFT`: `*Depvar` 80, `*User Material, constants=17`.
-- WARP/WEFT constant order:
-
-```text
-E11,E22,G12,G23,NU12,NU23,S1T,S1C,S2T,S2C,S12,S23,G1T,G1C,G2T,G2C,ETA
-```
-
-Current run settings from the manifests:
-
-```text
-candidate_id=puckzt_angle_0p8_g1c5
-abaqus_cmd=C:\Users\11843\codex_abaqus.cmd
-cpus=16
-drop_fraction=0.02
-poll_seconds=15
-min_points=10
-min_peak_mpa=100
-modulus_window_start=0.0021
-modulus_window_end=0.0052
-```
-
-## Completed Batches On The Original Machine
-
-These batches are already complete on the original workstation:
-
-```text
-puckzt_angle_0p8_g1c5_compression_35inp: SOLVED=35
-puckzt_angle_0p8_g1c5_compression_132:   SOLVED=31, ANALYSIS_FAILED=4, DATACHECK_FAILED=1
-puckzt_angle_0p8_g1c5_compression_qj:    SOLVED=30, ANALYSIS_FAILED=6
-```
-
-Known non-solved cases:
-
-```text
-132-48-24: ANALYSIS_FAILED, no valid metrics extracted.
-132-48-72: DATACHECK_FAILED. Raw deck structure issue: misplaced *ENDASSEMBLY around working.inp line 192014.
-132-60-12: ANALYSIS_FAILED, metrics extracted.
-132-72-12: ANALYSIS_FAILED, metrics extracted.
-132-72-24: ANALYSIS_FAILED, metrics extracted.
-QJ-48-72: ANALYSIS_FAILED, metrics extracted.
-QJ-60-48: ANALYSIS_FAILED, metrics extracted.
-QJ-60-60: ANALYSIS_FAILED, metrics extracted.
-QJ-60-72: ANALYSIS_FAILED, metrics extracted.
-QJ-72-12: ANALYSIS_FAILED, metrics extracted.
-QJ-72-48: ANALYSIS_FAILED, metrics extracted.
-```
-
-The failure states are intentional records; they should not block new batches.
-
-## Local Reports And Archive On The Original Machine
-
-Run summaries on the original workstation:
-
-```text
-D:\ZDYF_NBY\abqbatch\runs\puckzt_angle_0p8_g1c5_compression_35inp\reports\meso_compression_summary.xlsx
-D:\ZDYF_NBY\abqbatch\runs\puckzt_angle_0p8_g1c5_compression_132\reports\meso_compression_summary.xlsx
-D:\ZDYF_NBY\abqbatch\runs\puckzt_angle_0p8_g1c5_compression_qj\reports\meso_compression_summary.xlsx
+previous reference summary:
 D:\ZDYF_NBY\abqbatch\runs\puckzt_angle_0p8_g1c5_compression_all\reports\meso_compression_all_batches_summary.xlsx
+
+target workbook:
+D:\ZDYF_NBY\静强度数据集.xlsx
+
+archive root:
+E:\ZDYF_NBY_abqbatch_archive
+
+Abaqus wrapper:
+C:\Users\11843\codex_abaqus.cmd
 ```
 
-Large historical run files were moved off D: to E: on the original workstation:
+Never call raw `abaqus` from Codex. Always use the wrapper, directly or through the pipeline.
 
-```text
-E:\ZDYF_NBY_abqbatch_archive\runs_archive_20260629_142204
-D:\ZDYF_NBY\abqbatch\runs\archive_indexes\archive_index_20260629_142204.csv
-```
+## Preflight On The Takeover Machine
 
-Moved file classes:
-
-```text
-.dat
-.inp
-.msg
-```
-
-Count moved: `746`. Size moved: about `12.541 GB`.
-
-If a previous run's `working.inp`, raw copy, DAT, or MSG is needed for audit, restore it by searching the archive index by `original_path`, `run`, or `case_id`. The D: `runs` directory intentionally no longer contains those large historical files.
-
-## Completed Meso Shear Batch On The Original Machine
-
-Selected shear parameter JSON:
-
-```text
-D:\ZDYF_NBY\13-24-24-JQ-simulation\07_validation\final_selected_parameters\13_24_24_jq_shear_selected_hashin_vf053_beta2p2_pa1_0.json
-```
-
-Pipeline command group: `abqbatch meso-shear`.
-
-Final status after the 2026-07-01 repair run:
-
-```text
-13-inp / jq_shear_hashin_vf053_beta2p2_pa1_0_35inp: SOLVED=35
-132    / jq_shear_hashin_vf053_beta2p2_pa1_0_132:   SOLVED=36
-qj     / jq_shear_hashin_vf053_beta2p2_pa1_0_qj:    SOLVED=36
-all:                                                SOLVED=107
-```
-
-`132-48-72` was repaired after the initial datacheck failure. The broken 132 raw deck was missing the closing part/assembly structure, so that case now uses the complete JQ deck copy at `D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_132\repair_sources\132-48-72-jq.inp`; the generated `working.inp` patches `"Constraints Driver Shear_yx", 1, 1, 0.0800000000`. It passed datacheck and solved. Final metrics: 123 curve points, shear modulus 1.9558455805912422 GPa, stress at 0.05 strain 70.52457266858343 MPa, peak within 0.05 strain 70.20779992495136 MPa at strain 0.0496.
-
-Shear report workbooks on D:
-
-```text
-D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_35inp\reports\meso_shear_summary.xlsx
-D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_132\reports\meso_shear_summary.xlsx
-D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_qj\reports\meso_shear_summary.xlsx
-D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_all\reports\meso_shear_summary_all.xlsx
-```
-
-Shear archive indexes on D:
-
-```text
-D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_35inp\reports\archive_index.csv
-D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_132\reports\archive_index.csv
-D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_qj\reports\archive_index.csv
-D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_all\reports\archive_index_all.csv
-```
-
-Archived shear output root on E:
-
-```text
-E:\ZDYF_NBY_abqbatch_archive\jq_shear_hashin_vf053_beta2p2_pa1_0
-```
-
-Archive index row counts:
-
-```text
-35inp: 525
-132:   533
-qj:    540
-all:   1598
-```
-
-The D: shear work directories retain `manifest.json`, `state.json`, validation files, command logs, summary JSON, curve CSV, original inp copies, and working inp copies. Top-level Abaqus output classes such as `.odb`, `.stt`, `.sim`, `.mdl`, `.prt`, `.dat`, `.msg`, `.com`, `.023`, `.sta`, and `.log` were copied to E:, SHA256-verified, and removed from D:.
-
-To prepare a new shear batch on another machine, use the same selected JSON and raw deck directory:
+From `D:\ZDYF_NBY\abqbatch`:
 
 ```powershell
-abqbatch meso-shear prepare `
-  --selected-json "D:\ZDYF_NBY\13-24-24-JQ-simulation\07_validation\final_selected_parameters\13_24_24_jq_shear_selected_hashin_vf053_beta2p2_pa1_0.json" `
-  --input-dir "D:\ZDYF_NBY\abqbatch\qj" `
-  --run-dir "D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_qj_retry_01"
-
-abqbatch meso-shear smoke --run-dir "D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_qj_retry_01" --case QJ-12-12
-abqbatch meso-shear datacheck --run-dir "D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_qj_retry_01"
-abqbatch meso-shear run --run-dir "D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_qj_retry_01"
-abqbatch meso-shear report-xlsx --run-dir "D:\ZDYF_NBY\abqbatch\runs\jq_shear_hashin_vf053_beta2p2_pa1_0_qj_retry_01"
+git branch --show-current
+git log --oneline -8
+Get-Process | Where-Object { $_.ProcessName -in @('standard','explicit','pre','abq2021','ABQcaeK','ABQLauncher','SMAJobManager') }
+Get-ChildItem -Path runs\compression_strength_calibration\batches -Recurse -Filter *.odb -File -ErrorAction SilentlyContinue | Select-Object -First 20 FullName,Length
+& 'C:\Users\11843\codex_abaqus.cmd' information=environment
 ```
 
-## Recommended Recovery Strategy For Old Failures
+Expected before starting batch 07:
 
-Do not rerun old failed cases directly inside the archived historical run directories unless the needed `input/*.inp` files have been restored from E:.
+- Branch is `codex/meso-compression-batch-pipeline`.
+- Latest commit includes `916b9db Add calibration status workbook sheets`.
+- No solver process is running.
+- No `.odb` appears under `runs\compression_strength_calibration\batches`.
+- Abaqus environment is reachable through `C:\Users\11843\codex_abaqus.cmd`.
 
-Preferred approach for retrying old failures:
+## Refresh Plan Without Running Abaqus
 
-1. Create a new retry run directory from the committed raw source directory.
-2. Use the same parameter JSON and UMAT.
-3. Run datacheck first.
-4. Run analysis serially.
-5. Generate a new workbook and compare against the previous summary.
-
-Example for retrying all `qj` decks into a new run directory:
-
-```powershell
-abqbatch meso-compression prepare `
-  --params-json "D:\ZDYF_NBY\13-24-24-YS-simulation\07_validation\meso_vs_experiment\compression\puckzt_angle_0p8_g1c5_input_parameters.json" `
-  --input-dir "D:\ZDYF_NBY\abqbatch\qj" `
-  --run-dir "D:\ZDYF_NBY\abqbatch\runs\puckzt_angle_0p8_g1c5_compression_qj_retry_01"
-
-abqbatch meso-compression datacheck --run-dir "D:\ZDYF_NBY\abqbatch\runs\puckzt_angle_0p8_g1c5_compression_qj_retry_01"
-abqbatch meso-compression run --run-dir "D:\ZDYF_NBY\abqbatch\runs\puckzt_angle_0p8_g1c5_compression_qj_retry_01"
-abqbatch meso-compression report-xlsx --run-dir "D:\ZDYF_NBY\abqbatch\runs\puckzt_angle_0p8_g1c5_compression_qj_retry_01"
-```
-
-For a single-case retry, use the Python API so only that case is submitted:
+Use this safe command to rebuild `calibration_manifest.json`, `next_candidates.csv`, and `calibration_summary.xlsx` from current history. It does not start Abaqus.
 
 ```powershell
 $env:PYTHONDONTWRITEBYTECODE='1'
-@'
+$script = @"
+import sys
 from pathlib import Path
-from abqbatch.meso_compression import datacheck_cases, analysis_cases, collect_status, write_results_xlsx
+sys.path.insert(0, 'src')
+from abqbatch.meso_compression import calibrate_strength_command
 
-run_dir = Path(r"D:\ZDYF_NBY\abqbatch\runs\<retry_run_dir>")
-case_ids = ["QJ-48-72"]
-datacheck_cases(run_dir, case_ids=case_ids)
-analysis_cases(run_dir, case_ids=case_ids)
-print(collect_status(run_dir)["counts"])
-print(write_results_xlsx(run_dir))
-'@ | python -
+target = Path('D:/ZDYF_NBY') / '\u9759\u5f3a\u5ea6\u6570\u636e\u96c6.xlsx'
+calibrate_strength_command(
+    target_xlsx=target,
+    reference_summary_xlsx=[Path(r'D:\ZDYF_NBY\abqbatch\runs\puckzt_angle_0p8_g1c5_compression_all\reports\meso_compression_all_batches_summary.xlsx')],
+    params_json=Path(r'D:\ZDYF_NBY\13-24-24-YS-simulation\07_validation\meso_vs_experiment\compression\puckzt_angle_0p8_g1c5_input_parameters.json'),
+    current_summary_xlsx=None,
+    current_history_csv=Path(r'runs\compression_strength_calibration\calibration_history.csv'),
+    output_root=Path(r'runs\compression_strength_calibration'),
+    case_id=None,
+    batch_size=6,
+    max_new_attempts=3,
+    max_batches=1,
+    execute=False,
+    dry_run=False,
+    force=False,
+    batch_id='calibration_20260702_batch_07',
+    archive_root=Path(r'E:\ZDYF_NBY_abqbatch_archive'),
+    no_archive=False,
+    reference_angle_deg=0.8,
+    reference_g1c=5.0,
+)
+"@
+$script | python -B -
 ```
 
-## Disk Hygiene During Long Runs
+## Start Batch 07 After Explicit User Approval
 
-Do not delete large Abaqus outputs as a cleanup strategy. The current rule is:
-
-1. Extract DAT curves and write `summary.json` / curve CSV first.
-2. Copy heavy outputs to E: under the configured archive root.
-3. Verify SHA256 for the copied file.
-4. Remove the D: source only after verification succeeds.
-5. Write `archive_index.csv` and `archive_index.json` in the run's `reports/` directory.
-
-The shear pipeline does this automatically after each analysis case and after a failed datacheck case. If a rerun produces a different file with an already archived name, the existing E: file is preserved and the new file is archived with a timestamp/hash suffix. Manual backfill uses the same verified archive path:
+Only after the user explicitly says to resume real simulation, run this from `D:\ZDYF_NBY\abqbatch`. This starts datacheck and then serial analysis through the pipeline, then archives ODB files to E and writes D/E indexes.
 
 ```powershell
-abqbatch meso-shear archive-heavy --run-dir "D:\ZDYF_NBY\abqbatch\runs\<run_dir>"
+$env:PYTHONDONTWRITEBYTECODE='1'
+$script = @"
+import sys
+from pathlib import Path
+sys.path.insert(0, 'src')
+from abqbatch.meso_compression import calibrate_strength_command
+
+target = Path('D:/ZDYF_NBY') / '\u9759\u5f3a\u5ea6\u6570\u636e\u96c6.xlsx'
+calibrate_strength_command(
+    target_xlsx=target,
+    reference_summary_xlsx=[Path(r'D:\ZDYF_NBY\abqbatch\runs\puckzt_angle_0p8_g1c5_compression_all\reports\meso_compression_all_batches_summary.xlsx')],
+    params_json=Path(r'D:\ZDYF_NBY\13-24-24-YS-simulation\07_validation\meso_vs_experiment\compression\puckzt_angle_0p8_g1c5_input_parameters.json'),
+    current_summary_xlsx=None,
+    current_history_csv=Path(r'runs\compression_strength_calibration\calibration_history.csv'),
+    output_root=Path(r'runs\compression_strength_calibration'),
+    case_id=None,
+    batch_size=6,
+    max_new_attempts=3,
+    max_batches=1,
+    execute=True,
+    dry_run=False,
+    force=True,
+    batch_id='calibration_20260702_batch_07',
+    archive_root=Path(r'E:\ZDYF_NBY_abqbatch_archive'),
+    no_archive=False,
+    reference_angle_deg=0.8,
+    reference_g1c=5.0,
+)
+"@
+$script | python -B -
 ```
 
-Do not remove `state.json`, `manifest.json`, `validation.json`, `summary.json`, curve CSVs, original/working inp copies under `input/`, command logs, archive indexes, or report workbooks unless the run is intentionally discarded.
+Expected behavior:
 
-## Minimum Handoff Checklist
+- The command prepares six candidate directories under `runs\compression_strength_calibration\batches\calibration_20260702_batch_07`.
+- For each candidate it runs datacheck first, then analysis serially.
+- It appends six rows to `calibration_history.csv`.
+- It moves all `.odb` files for the batch to `E:\ZDYF_NBY_abqbatch_archive\compression_calibration_<stamp>\calibration_20260702_batch_07`.
+- It writes `runs\compression_strength_calibration\archive_indexes\calibration_20260702_batch_07_odb_archive_index.csv` on D and a matching index under the E archive directory.
+- It refreshes `calibration_manifest.json`, `next_candidates.csv`, and `calibration_summary.xlsx` after execution so they point at the next batch, not the just-completed batch.
 
-Before the new Codex submits any Abaqus job:
+## Post-Batch Verification
 
-- `git branch --show-current` returns `codex/meso-compression-batch-pipeline`.
-- `git lfs ls-files` reports `107` tracked `.inp` decks.
-- Parameter JSON and UMAT source exist on the new machine.
-- `C:\Users\11843\codex_abaqus.cmd information=environment` works and shows the safe wrapper environment.
-- No stale `.lck` files exist in the target run directory.
-- No `standard.exe` or `explicit.exe` process is already running.
-- The next run directory name is new and does not overwrite a completed run.
+Run these checks immediately after each batch.
+
+```powershell
+$batch='calibration_20260702_batch_07'
+$summary="runs\compression_strength_calibration\${batch}_execution_summary.json"
+if (Test-Path $summary) {
+  $e=Get-Content -Raw $summary | ConvertFrom-Json
+  $e.history_rows | Select-Object case_id,attempt_id,angle_deg,g1c,target_strength_mpa,compressive_strength_mpa,error_pct,accepted,status | Format-Table -AutoSize
+  $e.archive
+}
+
+Get-ChildItem -Path "runs\compression_strength_calibration\batches\$batch" -Recurse -Filter *.odb -File -ErrorAction SilentlyContinue | Select-Object FullName,Length
+
+$idx="runs\compression_strength_calibration\archive_indexes\${batch}_odb_archive_index.csv"
+if (Test-Path $idx) {
+  "rows=$((Import-Csv $idx).Count)"
+  Import-Csv $idx | Where-Object { -not $_.case_id -or -not $_.attempt_id -or -not $_.angle_deg -or -not $_.g1c -or -not $_.sha256 } | ConvertTo-Json
+}
+
+Get-Process | Where-Object { $_.ProcessName -in @('standard','explicit','pre','abq2021','ABQcaeK','ABQLauncher','SMAJobManager') } | Select-Object ProcessName,Id,CPU,StartTime
+```
+
+Expected after a healthy batch:
+
+- Six history rows exist in the execution summary.
+- D-drive batch directory has no `.odb` residuals.
+- D archive index has 12 rows: six datacheck ODB files plus six analysis ODB files.
+- Every archive index row has `batch_id`, `case_id`, `attempt_id`, `angle_deg`, `g1c`, `original_path`, `archive_path`, `size_bytes`, `sha256`, and `job_name`.
+- No solver process remains running.
+
+## Continue Adaptive Calibration After Batch 07
+
+After a batch finishes, inspect the refreshed candidates:
+
+```powershell
+Get-Content runs\compression_strength_calibration\next_candidates.csv
+$env:PYTHONDONTWRITEBYTECODE='1'
+$script = @"
+from pathlib import Path
+import sys
+sys.path.insert(0, 'src')
+from abqbatch.meso_compression import read_xlsx_rows
+xlsx = Path(r'runs\compression_strength_calibration\calibration_summary.xlsx')
+for sheet in ['overview', 'status_summary', 'next_candidates', 'max_attempts', 'archive_summary']:
+    print('---', sheet)
+    for row in read_xlsx_rows(xlsx, sheet_name=sheet)[:20]:
+        print(row)
+"@
+$script | python -B -
+```
+
+If `next_candidates.csv` contains another six candidates and the user has not requested a pause, run the next batch with a new unique `batch_id`, for example `calibration_20260702_batch_08`. Do not reuse an existing batch id unless deliberately rerunning with `force=True` and the user has confirmed overwriting the prepared directory is acceptable.
+
+## Reporting Artifacts
+
+The main workbook is:
+
+```text
+D:\ZDYF_NBY\abqbatch\runs\compression_strength_calibration\calibration_summary.xlsx
+```
+
+Important sheets:
+
+- `overview`: high-level counts and archive totals.
+- `status_summary`: decision status and data-role counts.
+- `next_candidates`: next batch to execute.
+- `accepted_cases`: cases accepted from old or current actual simulations.
+- `max_attempts`: cases that reached three new attempts without satisfying the 15% criterion.
+- `archive_summary`: one row per archived calibration batch, with E-drive batch archive directories.
+- `archive_index`: row-level ODB archive traceability.
+- `decisions`: all active-case decisions.
+- `targets`: parsed `TARGET_ONLY` records.
+- `simulation_points`: parsed `REFERENCE_SIM` and `CURRENT_SIM` records.
+
+## Git And Remote Notes
+
+The code changes needed for adaptive calibration are committed locally. Do not push to the remote unless the user explicitly authorizes remote push.
+
+If the user approves pushing:
+
+```powershell
+git push origin codex/meso-compression-batch-pipeline
+```
+
+There are unrelated dirty worktree files on the original machine. Do not revert or include them unless the user explicitly requests it. When committing future fixes, stage only the files changed for the task.
+
+## Hard Guardrails
+
+- Do not use the target workbook as a simulation/reference point source.
+- Do not start batch 07 or later without explicit user approval if the last user instruction was to pause.
+- Do not call raw `abaqus`; use `C:\Users\11843\codex_abaqus.cmd` through the pipeline.
+- Do not leave `.odb` files on D after a completed batch.
+- Do not delete `.dat`, curve CSV, summary JSON, state JSON, manifest JSON, history CSV, archive indexes, or workbooks from D.
+- Do not mark the goal complete until every active case is accepted or has a documented max-attempt outcome, all ODB files are archived and indexed, and the summary workbook is current.
