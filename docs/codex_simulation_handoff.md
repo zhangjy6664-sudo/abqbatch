@@ -2,12 +2,13 @@
 
 This document is for a Codex instance on another Windows workstation taking over the Abaqus meso compression calibration work.
 
-Last updated: 2026-07-02 18:50 Asia/Shanghai.
+Last updated: 2026-07-02 19:00 Asia/Shanghai.
 
 ## Current State
 
 - Repository branch: `codex/meso-compression-batch-pipeline`.
 - Latest local commits on this branch:
+  - `b46b2b9 Add advisor-reviewed compression calibration decisions`
   - `916b9db Add calibration status workbook sheets`
   - `b6ef78b Refresh calibration plan after executed batches`
   - `ec2b12a Accept qualifying reference compression results`
@@ -60,13 +61,13 @@ Special source deck rule:
 The next planned batch is `calibration_20260702_batch_07`.
 
 ```text
-slot  case_id   attempt  angle_deg  g1c  target_strength_mpa  reason
-1     13-60-60  3        2.0        5.0  159.13               nearest_sim_above_target_reduce_strength
-2     13-60-72  3        2.0        5.0  140.62               nearest_sim_above_target_reduce_strength
-3     13-72-36  3        2.0        5.0  195.35               nearest_sim_above_target_reduce_strength
-4     13-72-48  2        2.5        5.0  164.17               nearest_sim_above_target_reduce_strength
-5     13-72-60  1        3.0        5.0  153.48               nearest_sim_above_target_reduce_strength
-6     13-72-72  1        3.0        5.0  145.53               nearest_sim_above_target_reduce_strength
+slot  case_id   attempt  angle_deg  g1c   selected_by      trend_summary                    target_strength_mpa
+1     13-60-60  3        3.0        15.0  advisor_review  avoid_angle_decrease             159.13
+2     13-60-72  3        3.0        15.0  advisor_review  avoid_angle_decrease             140.62
+3     13-72-36  3        3.0        15.0  advisor_review  avoid_angle_decrease             195.35
+4     13-72-48  2        2.5        5.0   advisor_review  no_worsening_direction_detected  164.17
+5     13-72-60  1        3.0        5.0   advisor_review  no_worsening_direction_detected  153.48
+6     13-72-72  1        3.0        5.0   advisor_review  no_worsening_direction_detected  145.53
 ```
 
 The max-attempt cases already recorded before batch 07 are:
@@ -117,7 +118,7 @@ Get-ChildItem -Path runs\compression_strength_calibration\batches -Recurse -Filt
 Expected before starting batch 07:
 
 - Branch is `codex/meso-compression-batch-pipeline`.
-- Latest commit includes `916b9db Add calibration status workbook sheets`.
+- Latest commit includes `b46b2b9 Add advisor-reviewed compression calibration decisions`.
 - No solver process is running.
 - No `.odb` appears under `runs\compression_strength_calibration\batches`.
 - Abaqus environment is reachable through `C:\Users\11843\codex_abaqus.cmd`.
@@ -272,7 +273,7 @@ Important sheets:
 
 - `overview`: high-level counts and archive totals.
 - `status_summary`: decision status and data-role counts.
-- `next_candidates`: next batch to execute.
+- `next_candidates`: next batch to execute, including `selected_by`, `advisor_rationale`, and `trend_summary`.
 - `accepted_cases`: cases accepted from old or current actual simulations.
 - `max_attempts`: cases that reached three new attempts without satisfying the 15% criterion.
 - `archive_summary`: one row per archived calibration batch, with E-drive batch archive directories.
