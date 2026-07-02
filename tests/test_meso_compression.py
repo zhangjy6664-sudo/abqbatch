@@ -557,3 +557,75 @@ def test_run_calibration_batch_updates_history_and_archives(
     assert rows[0]["data_role"] == CURRENT_SIM
     assert rows[0]["case_id"] == "13-12-24"
     assert rows[0]["compressive_strength_mpa"] == "185.0"
+
+
+def test_calibrate_strength_refreshes_next_candidates_after_execution(
+    workspace_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target_xlsx = workspace_tmp / "targets.xlsx"
+    write_xlsx(
+        target_xlsx,
+        {
+            "Sheet1": [
+                ["group", "dim_a", "dim_b", "ignored", "compression_strength"],
+                [1, 12, 12, 999, 100.0],
+                [1, 12, 24, 999, 200.0],
+            ]
+        },
+    )
+    params_path = workspace_tmp / "params.json"
+    params_path.write_text("{}", encoding="utf-8")
+
+    def fake_run_calibration_batch(**kwargs):
+        candidate = kwargs["candidates"][0]
+        assert candidate["case_id"] == "13-12-12"
+        return {
+            "batch_id": kwargs["batch_id"],
+            "history_rows": [
+                {
+                    "data_role": CURRENT_SIM,
+                    "batch_id": kwargs["batch_id"],
+                    "case_id": "13-12-12",
+                    "case_key": "13-12-12",
+                    "attempt_id": candidate["attempt_id"],
+                    "angle_deg": candidate["angle_deg"],
+                    "g1c": candidate["g1c"],
+                    "target_strength_mpa": 100.0,
+                    "compressive_strength_mpa": 100.0,
+                    "error_pct": 0.0,
+                    "accepted": True,
+                    "status": "SOLVED",
+                }
+            ],
+            "archive": None,
+        }
+
+    monkeypatch.setattr(meso_compression, "run_calibration_batch", fake_run_calibration_batch)
+
+    output_root = workspace_tmp / "calibration"
+    meso_compression.calibrate_strength_command(
+        target_xlsx=target_xlsx,
+        reference_summary_xlsx=None,
+        params_json=params_path,
+        current_summary_xlsx=None,
+        current_history_csv=workspace_tmp / "history.csv",
+        output_root=output_root,
+        case_id=None,
+        batch_size=1,
+        max_new_attempts=3,
+        max_batches=1,
+        execute=True,
+        dry_run=False,
+        force=False,
+        batch_id="batch_001",
+        archive_root=workspace_tmp / "archive",
+        no_archive=True,
+    )
+
+    with (output_root / "next_candidates.csv").open("r", encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert rows[0]["case_id"] == "13-12-24"
+    manifest = json.loads((output_root / "calibration_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["plan_phase"] == "post_execution_next_batch"
+    assert manifest["last_executed_batch_id"] == "batch_001"
+

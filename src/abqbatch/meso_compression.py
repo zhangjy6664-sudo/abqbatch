@@ -2521,21 +2521,21 @@ def calibrate_strength_command(
     last_plan: dict[str, Any] | None = None
     paths: dict[str, Path] | None = None
     executed_batches = 0
-    for batch_index in range(1, max_batches + 1):
-        sim_records = list(reference_records) + list(current_summary_records)
-        sim_records.extend(read_calibration_history(history_csv))
-        this_batch_id = batch_prefix if max_batches == 1 else f"{batch_prefix}_b{batch_index:02d}"
-        plan = build_calibration_plan(
-            targets,
-            sim_records,
-            case_ids=set(case_id) if case_id else None,
-            batch_size=batch_size,
-            max_new_attempts=max_new_attempts,
-        )
+
+    def add_plan_metadata(
+        plan: dict[str, Any],
+        *,
+        this_batch_id: str,
+        batch_index: int,
+        plan_phase: str,
+        last_executed_batch_id: str | None = None,
+    ) -> dict[str, Any]:
         plan.update(
             {
                 "batch_id": this_batch_id,
                 "batch_index": batch_index,
+                "plan_phase": plan_phase,
+                "last_executed_batch_id": last_executed_batch_id,
                 "target_xlsx": str(target_xlsx),
                 "reference_summary_xlsx": [str(path) for path in reference_summary_xlsx or []],
                 "current_summary_xlsx": [str(path) for path in current_summary_xlsx or []],
@@ -2550,6 +2550,25 @@ def calibrate_strength_command(
                     "current_history": CURRENT_SIM,
                 },
             }
+        )
+        return plan
+
+    for batch_index in range(1, max_batches + 1):
+        sim_records = list(reference_records) + list(current_summary_records)
+        sim_records.extend(read_calibration_history(history_csv))
+        this_batch_id = batch_prefix if max_batches == 1 else f"{batch_prefix}_b{batch_index:02d}"
+        plan = build_calibration_plan(
+            targets,
+            sim_records,
+            case_ids=set(case_id) if case_id else None,
+            batch_size=batch_size,
+            max_new_attempts=max_new_attempts,
+        )
+        add_plan_metadata(
+            plan,
+            this_batch_id=this_batch_id,
+            batch_index=batch_index,
+            plan_phase="pre_execution",
         )
         paths = write_calibration_outputs(output_root, plan, targets, sim_records)
         last_plan = plan
@@ -2569,7 +2588,23 @@ def calibrate_strength_command(
         executed_batches += 1
         plan["execution"] = execution
         sim_records.extend(execution["history_rows"])
-        paths = write_calibration_outputs(output_root, plan, targets, sim_records)
+        refreshed_plan = build_calibration_plan(
+            targets,
+            sim_records,
+            case_ids=set(case_id) if case_id else None,
+            batch_size=batch_size,
+            max_new_attempts=max_new_attempts,
+        )
+        add_plan_metadata(
+            refreshed_plan,
+            this_batch_id=this_batch_id,
+            batch_index=batch_index,
+            plan_phase="post_execution_next_batch",
+            last_executed_batch_id=this_batch_id,
+        )
+        refreshed_plan["last_execution"] = execution
+        paths = write_calibration_outputs(output_root, refreshed_plan, targets, sim_records)
+        last_plan = refreshed_plan
 
     if last_plan is None or paths is None:
         raise typer.Exit(1)
