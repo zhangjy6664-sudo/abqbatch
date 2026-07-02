@@ -1713,6 +1713,10 @@ def read_calibration_history(path: Path) -> list[dict[str, Any]]:
                     "g1c": g1c,
                     "compressive_strength_mpa": strength,
                     "status": row.get("status"),
+                    "selected_by": row.get("selected_by"),
+                    "advisor_rationale": row.get("advisor_rationale"),
+                    "trend_summary": row.get("trend_summary"),
+                    "skipped_candidates": row.get("skipped_candidates"),
                     "job_name": row.get("job_name"),
                     "attempt_id": row.get("attempt_id"),
                     "batch_id": row.get("batch_id"),
@@ -1737,6 +1741,10 @@ def append_calibration_history(path: Path, rows: list[dict[str, Any]]) -> None:
         "error_pct",
         "accepted",
         "status",
+        "selected_by",
+        "advisor_rationale",
+        "trend_summary",
+        "skipped_candidates",
         "job_name",
         "run_dir",
         "state_json",
@@ -1829,6 +1837,11 @@ def _candidate_from_sim_bracket(
                     "g1c": float(g1c),
                     "reason": "same_g1c_strength_bracket",
                     "span_mpa": abs(y2 - y1),
+                    "selected_by": "linear_interpolation",
+                    "advisor_rationale": (
+                        "target is bracketed by real simulation strengths at constant G1C; "
+                        "angle was linearly interpolated"
+                    ),
                 }
             )
     for angle, group in by_angle.items():
@@ -1848,6 +1861,11 @@ def _candidate_from_sim_bracket(
                     "g1c": g1c,
                     "reason": "same_angle_log_g1c_strength_bracket",
                     "span_mpa": abs(y2 - y1),
+                    "selected_by": "linear_interpolation",
+                    "advisor_rationale": (
+                        "target is bracketed by real simulation strengths at constant angle; "
+                        "G1C was interpolated in log space"
+                    ),
                 }
             )
     for candidate in sorted(
@@ -1860,25 +1878,137 @@ def _candidate_from_sim_bracket(
     return None
 
 
-def _fallback_candidate(
+def _record_error(record: dict[str, Any], target_strength: float) -> float:
+    return strength_error_pct(
+        target_strength_mpa=target_strength,
+        simulated_strength_mpa=float(record["compressive_strength_mpa"]),
+    )
+
+
+def _attempt_sort_key(record: dict[str, Any]) -> tuple[int, float, float, str]:
+    role_rank = 1 if record.get("data_role") == CURRENT_SIM else 0
+    attempt = _coerce_float(record.get("attempt_id"))
+    attempt_rank = attempt if attempt is not None else 0.0
+    return (role_rank, attempt_rank, float(record["angle_deg"]), str(record.get("job_name") or ""))
+
+
+def _trend_worsening_directions(
+    records: list[dict[str, Any]], *, target_strength: float
+) -> set[tuple[str, str]]:
+    current_records = [record for record in records if record.get("data_role") == CURRENT_SIM]
+    ordered = sorted(current_records, key=_attempt_sort_key)
+    worsening: set[tuple[str, str]] = set()
+    for previous, current in zip(ordered, ordered[1:], strict=False):
+        previous_error = _record_error(previous, target_strength)
+        current_error = _record_error(current, target_strength)
+        if current_error <= previous_error + 1e-9:
+            continue
+        previous_angle = float(previous["angle_deg"])
+        current_angle = float(current["angle_deg"])
+        previous_g1c = float(previous["g1c"])
+        current_g1c = float(current["g1c"])
+        if abs(previous_g1c - current_g1c) <= 1e-6 and abs(previous_angle - current_angle) > 1e-6:
+            direction = "increase" if current_angle > previous_angle else "decrease"
+            worsening.add(("angle", direction))
+        if abs(previous_angle - current_angle) <= 1e-6 and abs(previous_g1c - current_g1c) > 1e-6:
+            direction = "increase" if current_g1c > previous_g1c else "decrease"
+            worsening.add(("g1c", direction))
+    return worsening
+
+
+def _movement_direction(
+    from_record: dict[str, Any], angle: float, g1c: float
+) -> list[tuple[str, str]]:
+    movement: list[tuple[str, str]] = []
+    from_angle = float(from_record["angle_deg"])
+    from_g1c = float(from_record["g1c"])
+    if abs(angle - from_angle) > 1e-6:
+        movement.append(("angle", "increase" if angle > from_angle else "decrease"))
+    if abs(g1c - from_g1c) > 1e-6:
+        movement.append(("g1c", "increase" if g1c > from_g1c else "decrease"))
+    return movement
+
+
+def _fallback_grid(
+    best_strength: float, target_strength: float
+) -> tuple[str, list[tuple[float, float]]]:
+    if best_strength > target_strength:
+        return (
+            "nearest_sim_above_target_reduce_strength",
+            [(3.0, 5.0), (2.5, 5.0), (2.0, 5.0), (3.0, 15.0), (2.0, 15.0), (1.0, 5.0)],
+        )
+    return (
+        "nearest_sim_below_target_raise_strength",
+        [(1.0, 120.0), (1.0, 80.0), (1.5, 120.0), (1.0, 60.0), (2.0, 120.0), (1.0, 30.0)],
+    )
+
+
+def _advisor_candidate(
     records: list[dict[str, Any]], *, target_strength: float
 ) -> dict[str, Any] | None:
     if not records:
-        return {"angle_deg": ANGLE_MIN_DEG, "g1c": G1C_MIN, "reason": "initial_exploration"}
-    best = min(
-        records,
-        key=lambda item: abs(float(item["compressive_strength_mpa"]) - target_strength),
-    )
+        return {
+            "angle_deg": ANGLE_MAX_DEG,
+            "g1c": G1C_MIN,
+            "reason": "initial_exploration",
+            "selected_by": "exploration",
+            "advisor_rationale": (
+                "no real simulation points exist for this case; "
+                "selected a bounded exploration point"
+            ),
+            "trend_summary": "no_case_history",
+        }
+    best = min(records, key=lambda item: _record_error(item, target_strength))
+    best_error = _record_error(best, target_strength)
     best_strength = float(best["compressive_strength_mpa"])
-    if best_strength > target_strength:
-        grid = [(3.0, 5.0), (2.5, 5.0), (2.0, 5.0), (3.0, 15.0), (2.0, 15.0), (1.0, 5.0)]
-        reason = "nearest_sim_above_target_reduce_strength"
-    else:
-        grid = [(1.0, 120.0), (1.0, 80.0), (1.5, 120.0), (1.0, 60.0), (2.0, 120.0), (1.0, 30.0)]
-        reason = "nearest_sim_below_target_raise_strength"
+    worsening = _trend_worsening_directions(records, target_strength=target_strength)
+    reason, grid = _fallback_grid(best_strength, target_strength)
+    skipped: list[str] = []
+    for angle, g1c in grid:
+        if _sampled(records, angle, g1c):
+            skipped.append(f"sampled:{angle:g}/{g1c:g}")
+            continue
+        movement = _movement_direction(best, angle, g1c)
+        harmful = [item for item in movement if item in worsening]
+        if harmful:
+            skipped.append(
+                f"worsening_direction:{angle:g}/{g1c:g}:"
+                + ",".join(f"{axis}_{direction}" for axis, direction in harmful)
+            )
+            continue
+        trend_text = (
+            "no_worsening_direction_detected"
+            if not worsening
+            else "avoid_" + ",".join(f"{axis}_{direction}" for axis, direction in sorted(worsening))
+        )
+        return {
+            "angle_deg": angle,
+            "g1c": g1c,
+            "reason": reason,
+            "selected_by": "advisor_review",
+            "advisor_rationale": (
+                f"best real point error is {best_error:.3f}% at "
+                f"angle={float(best['angle_deg']):g}, G1C={float(best['g1c']):g}; "
+                f"{trend_text}; selected first unsampled candidate that does not continue "
+                "a worsening direction"
+            ),
+            "trend_summary": trend_text,
+            "skipped_candidates": ";".join(skipped),
+        }
     for angle, g1c in grid:
         if not _sampled(records, angle, g1c):
-            return {"angle_deg": angle, "g1c": g1c, "reason": reason}
+            return {
+                "angle_deg": angle,
+                "g1c": g1c,
+                "reason": "advisor_exploration_after_trend_constraints",
+                "selected_by": "exploration",
+                "advisor_rationale": (
+                    "all preferred unsampled candidates continued a worsening direction; "
+                    "selected a remaining bounded exploration point and flagged the trend"
+                ),
+                "trend_summary": "trend_constraints_exhausted",
+                "skipped_candidates": ";".join(skipped),
+            }
     return None
 
 
@@ -1915,6 +2045,10 @@ def select_strength_candidate(
             "accepted_angle_deg": record["angle_deg"],
             "accepted_g1c": record["g1c"],
             "reason": "simulation_within_error_limit",
+            "selected_by": "accept_existing_sim",
+            "advisor_rationale": (
+                "existing actual simulation point is within the 15% target-strength error limit"
+            ),
         }
 
     current_attempts = sum(1 for record in records if record.get("data_role") == CURRENT_SIM)
@@ -1936,11 +2070,17 @@ def select_strength_candidate(
             "current_attempts": current_attempts,
             "best_error_pct": round(best_error, 6) if best_error is not None else None,
             "reason": "max_new_attempts_reached_without_acceptance",
+            "selected_by": "advisor_review",
+            "advisor_rationale": (
+                "case reached the maximum number of current calibration attempts without "
+                "meeting the 15% acceptance limit; mark for model review"
+            ),
+            "needs_model_review": True,
         }
 
     candidate = _candidate_from_sim_bracket(records, target_strength=target_strength)
     if candidate is None:
-        candidate = _fallback_candidate(records, target_strength=target_strength)
+        candidate = _advisor_candidate(records, target_strength=target_strength)
     if candidate is None:
         return {
             "status": "no_unsampled_candidate",
@@ -1949,6 +2089,9 @@ def select_strength_candidate(
             "target_strength_mpa": target_strength,
             "current_attempts": current_attempts,
             "reason": "exploration_grid_exhausted",
+            "selected_by": "advisor_review",
+            "advisor_rationale": "no unsampled bounded candidate remains after advisor review",
+            "needs_model_review": True,
         }
     attempt_id = current_attempts + 1
     return {
@@ -1962,6 +2105,10 @@ def select_strength_candidate(
         "source_inp": target.get("source_inp"),
         "planned_data_role": CURRENT_SIM,
         "reason": candidate["reason"],
+        "selected_by": candidate.get("selected_by", "advisor_review"),
+        "advisor_rationale": candidate.get("advisor_rationale"),
+        "trend_summary": candidate.get("trend_summary"),
+        "skipped_candidates": candidate.get("skipped_candidates"),
         "current_attempts": current_attempts,
     }
 
@@ -2174,6 +2321,9 @@ def write_calibration_outputs(
         "g1c",
         "target_strength_mpa",
         "planned_data_role",
+        "selected_by",
+        "advisor_rationale",
+        "trend_summary",
         "reason",
         "source_inp",
     ]
@@ -2189,6 +2339,8 @@ def write_calibration_outputs(
         "accepted_source_role",
         "accepted_angle_deg",
         "accepted_g1c",
+        "selected_by",
+        "advisor_rationale",
         "reason",
     ]
     max_attempt_headers = [
@@ -2196,6 +2348,9 @@ def write_calibration_outputs(
         "target_strength_mpa",
         "current_attempts",
         "best_error_pct",
+        "selected_by",
+        "advisor_rationale",
+        "needs_model_review",
         "reason",
     ]
     write_xlsx(
@@ -2283,6 +2438,9 @@ def build_calibration_candidate_params(
             "calibration_case_id": case_id,
             "calibration_attempt_id": candidate.get("attempt_id"),
             "calibration_data_role": CURRENT_SIM,
+            "selected_by": candidate.get("selected_by"),
+            "advisor_rationale": candidate.get("advisor_rationale"),
+            "trend_summary": candidate.get("trend_summary"),
         }
     )
     for material_name in ("WARP", "WEFT"):
@@ -2392,6 +2550,10 @@ def calibration_history_row_from_case(
         "error_pct": round(error, 6) if error is not None else None,
         "accepted": accepted,
         "status": state.get("status"),
+        "selected_by": candidate.get("selected_by"),
+        "advisor_rationale": candidate.get("advisor_rationale"),
+        "trend_summary": candidate.get("trend_summary"),
+        "skipped_candidates": candidate.get("skipped_candidates"),
         "job_name": case.get("job_name"),
         "run_dir": str(Path(case["case_dir"]).parent.parent.parent),
         "state_json": str(_case_state_path(case)),

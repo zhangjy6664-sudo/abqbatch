@@ -367,6 +367,107 @@ def test_strength_candidate_uses_simulation_bracket() -> None:
     assert decision["angle_deg"] == 2.0
     assert decision["g1c"] == 5.0
     assert decision["planned_data_role"] == CURRENT_SIM
+    assert decision["selected_by"] == "linear_interpolation"
+    assert "bracketed" in decision["advisor_rationale"]
+
+
+def test_reference_summary_acceptance_does_not_plan_attempt() -> None:
+    target = {
+        "data_role": TARGET_ONLY,
+        "case_id": "13-12-24",
+        "case_key": "13-12-24",
+        "target_strength_mpa": 100.0,
+        "excluded": False,
+    }
+    sim_records = [
+        {
+            "data_role": REFERENCE_SIM,
+            "case_id": "13-12-24",
+            "case_key": "13-12-24",
+            "angle_deg": 0.8,
+            "g1c": 5.0,
+            "compressive_strength_mpa": 110.0,
+        }
+    ]
+
+    plan = meso_compression.build_calibration_plan([target], sim_records, batch_size=3)
+
+    assert plan["candidates"] == []
+    assert plan["decisions"][0]["status"] == "accepted"
+    assert plan["decisions"][0]["selected_by"] == "accept_existing_sim"
+
+
+def test_single_case_gets_at_most_one_candidate_per_plan() -> None:
+    target = {
+        "data_role": TARGET_ONLY,
+        "case_id": "13-12-24",
+        "case_key": "13-12-24",
+        "target_strength_mpa": 100.0,
+        "excluded": False,
+        "source_inp": "13-inp/13-12-24.inp",
+    }
+    sim_records = [
+        {
+            "data_role": REFERENCE_SIM,
+            "case_id": "13-12-24",
+            "case_key": "13-12-24",
+            "angle_deg": 0.8,
+            "g1c": 5.0,
+            "compressive_strength_mpa": 150.0,
+        }
+    ]
+
+    plan = meso_compression.build_calibration_plan([target], sim_records, batch_size=6)
+
+    assert len(plan["candidates"]) == 1
+    assert plan["candidates"][0]["case_id"] == "13-12-24"
+    assert plan["candidates"][0]["attempt_id"] == 1
+
+
+def test_advisor_avoids_worsening_angle_fallback_direction() -> None:
+    target = {
+        "data_role": TARGET_ONLY,
+        "case_id": "13-12-24",
+        "case_key": "13-12-24",
+        "target_strength_mpa": 100.0,
+        "source_inp": "13-inp/13-12-24.inp",
+    }
+    sim_records = [
+        {
+            "data_role": REFERENCE_SIM,
+            "case_id": "13-12-24",
+            "case_key": "13-12-24",
+            "angle_deg": 0.8,
+            "g1c": 5.0,
+            "compressive_strength_mpa": 150.0,
+        },
+        {
+            "data_role": CURRENT_SIM,
+            "case_id": "13-12-24",
+            "case_key": "13-12-24",
+            "attempt_id": 1,
+            "angle_deg": 3.0,
+            "g1c": 5.0,
+            "compressive_strength_mpa": 120.0,
+        },
+        {
+            "data_role": CURRENT_SIM,
+            "case_id": "13-12-24",
+            "case_key": "13-12-24",
+            "attempt_id": 2,
+            "angle_deg": 2.5,
+            "g1c": 5.0,
+            "compressive_strength_mpa": 130.0,
+        },
+    ]
+
+    decision = select_strength_candidate(target, sim_records)
+
+    assert decision["status"] == "planned"
+    assert decision["selected_by"] == "advisor_review"
+    assert not (decision["angle_deg"] == 2.0 and decision["g1c"] == 5.0)
+    assert "avoid_angle_decrease" in decision["advisor_rationale"]
+    assert decision["trend_summary"] == "avoid_angle_decrease"
 
 
 def test_strength_error_uses_target_denominator() -> None:
@@ -493,6 +594,9 @@ def test_run_calibration_batch_updates_history_and_archives(
         "angle_deg": 2.0,
         "g1c": 40.0,
         "target_strength_mpa": 200.0,
+        "selected_by": "advisor_review",
+        "advisor_rationale": "test rationale",
+        "trend_summary": "test trend",
     }
 
     def fake_datacheck(run_dir: Path, *, case_ids=None, dry_run: bool = False):
@@ -549,6 +653,8 @@ def test_run_calibration_batch_updates_history_and_archives(
     assert result["history_rows"][0]["compressive_strength_mpa"] == 185.0
     assert result["history_rows"][0]["error_pct"] == 7.5
     assert result["history_rows"][0]["accepted"] is True
+    assert result["history_rows"][0]["selected_by"] == "advisor_review"
+    assert result["history_rows"][0]["advisor_rationale"] == "test rationale"
     assert archive_calls[0]["batch_id"] == "batch_001"
     archived_jobs = {row["job_name"] for row in archive_calls[0]["attempt_rows"]}
     assert any(job.startswith("mc_13_12_24_cal_a2") for job in archived_jobs)
@@ -626,6 +732,8 @@ def test_calibrate_strength_refreshes_next_candidates_after_execution(
     with (output_root / "next_candidates.csv").open("r", encoding="utf-8", newline="") as stream:
         rows = list(csv.DictReader(stream))
     assert rows[0]["case_id"] == "13-12-24"
+    assert rows[0]["selected_by"]
+    assert rows[0]["advisor_rationale"]
     manifest = json.loads((output_root / "calibration_manifest.json").read_text(encoding="utf-8"))
     assert manifest["plan_phase"] == "post_execution_next_batch"
     assert manifest["last_executed_batch_id"] == "batch_001"
@@ -689,6 +797,9 @@ def test_calibration_summary_xlsx_includes_status_and_archive_sheets(workspace_t
                 "g1c": 5.0,
                 "target_strength_mpa": 200.0,
                 "planned_data_role": CURRENT_SIM,
+                "selected_by": "advisor_review",
+                "advisor_rationale": "picked by test advisor",
+                "trend_summary": "test trend",
                 "reason": "explore",
                 "source_inp": "13-inp/13-12-24.inp",
             }
@@ -702,6 +813,8 @@ def test_calibration_summary_xlsx_includes_status_and_archive_sheets(workspace_t
                 "accepted_source_role": REFERENCE_SIM,
                 "accepted_angle_deg": 0.8,
                 "accepted_g1c": 5.0,
+                "selected_by": "accept_existing_sim",
+                "advisor_rationale": "accepted from reference",
                 "reason": "simulation_within_error_limit",
             },
             {
@@ -719,6 +832,9 @@ def test_calibration_summary_xlsx_includes_status_and_archive_sheets(workspace_t
                 "target_strength_mpa": 300.0,
                 "current_attempts": 3,
                 "best_error_pct": 20.0,
+                "selected_by": "advisor_review",
+                "advisor_rationale": "needs review",
+                "needs_model_review": True,
                 "reason": "max_new_attempts_reached_without_acceptance",
             },
         ],
@@ -744,6 +860,9 @@ def test_calibration_summary_xlsx_includes_status_and_archive_sheets(workspace_t
     status_rows = read_xlsx_rows(paths["xlsx"], sheet_name="status_summary")
     assert ["decision_status", "max_attempts_reached", 1] in status_rows
     assert ["simulation_data_role", CURRENT_SIM, 1] in status_rows
+    next_candidates = read_xlsx_rows(paths["xlsx"], sheet_name="next_candidates")
+    assert "selected_by" in next_candidates[0]
+    assert "advisor_rationale" in next_candidates[0]
     assert read_xlsx_rows(paths["xlsx"], sheet_name="max_attempts")[1][0] == "13-12-36"
     archive_summary = read_xlsx_rows(paths["xlsx"], sheet_name="archive_summary")
     assert archive_summary[0][-1] == "archive_dir"
