@@ -13,6 +13,7 @@ from abqbatch.meso_compression import (
     REFERENCE_SIM,
     TARGET_ONLY,
     archive_odb_files,
+    delete_odb_files,
     parse_sim_summary_xlsx,
     parse_strength_targets,
     prepare_batch,
@@ -363,12 +364,14 @@ def test_strength_candidate_uses_simulation_bracket() -> None:
     decision = select_strength_candidate(target, sim_records)
 
     assert decision["status"] == "planned"
-    assert decision["reason"] == "same_g1c_strength_bracket"
+    assert decision["reason"] == "same_g1c_angle_only_strength_bracket"
     assert decision["angle_deg"] == 2.0
     assert decision["g1c"] == 5.0
     assert decision["planned_data_role"] == CURRENT_SIM
-    assert decision["selected_by"] == "linear_interpolation"
-    assert "bracketed" in decision["advisor_rationale"]
+    assert decision["selected_by"] == "codex_advisor_review"
+    assert decision["decision_axis"] == "angle_only"
+    assert decision["physical_direction"] == "reduce_strength"
+    assert "bracket" in decision["advisor_rationale"]
 
 
 def test_reference_summary_acceptance_does_not_plan_attempt() -> None:
@@ -424,7 +427,7 @@ def test_single_case_gets_at_most_one_candidate_per_plan() -> None:
     assert plan["candidates"][0]["attempt_id"] == 1
 
 
-def test_advisor_avoids_worsening_angle_fallback_direction() -> None:
+def test_codex_advisor_respects_physical_direction_when_sim_is_too_high() -> None:
     target = {
         "data_role": TARGET_ONLY,
         "case_id": "13-12-24",
@@ -464,10 +467,116 @@ def test_advisor_avoids_worsening_angle_fallback_direction() -> None:
     decision = select_strength_candidate(target, sim_records)
 
     assert decision["status"] == "planned"
-    assert decision["selected_by"] == "advisor_review"
-    assert not (decision["angle_deg"] == 2.0 and decision["g1c"] == 5.0)
-    assert "avoid_angle_decrease" in decision["advisor_rationale"]
-    assert decision["trend_summary"] == "avoid_angle_decrease"
+    assert decision["selected_by"] == "codex_advisor_review"
+    assert decision["physical_direction"] == "reduce_strength"
+    assert decision["decision_axis"] == "angle_only"
+    assert decision["angle_deg"] > 3.0
+    assert decision["g1c"] == 5.0
+    assert "increase angle" in decision["advisor_rationale"]
+    assert "G1C is not adjusted" in decision["advisor_rationale"]
+    assert "physical_direction_violation" in decision["monotonic_violation"]
+    assert "Historical physical-direction violation" in decision["advisor_rationale"]
+
+
+def test_codex_advisor_respects_physical_direction_when_sim_is_too_low() -> None:
+    target = {
+        "data_role": TARGET_ONLY,
+        "case_id": "13-12-36",
+        "case_key": "13-12-36",
+        "target_strength_mpa": 200.0,
+        "source_inp": "13-inp/13-12-36.inp",
+    }
+    sim_records = [
+        {
+            "data_role": CURRENT_SIM,
+            "case_id": "13-12-36",
+            "case_key": "13-12-36",
+            "attempt_id": 1,
+            "angle_deg": 3.0,
+            "g1c": 20.0,
+            "compressive_strength_mpa": 160.0,
+        },
+    ]
+
+    decision = select_strength_candidate(target, sim_records)
+
+    assert decision["status"] == "planned"
+    assert decision["physical_direction"] == "increase_strength"
+    assert decision["decision_axis"] == "angle_only"
+    assert decision["angle_deg"] < 3.0
+    assert decision["g1c"] == 20.0
+    assert "decrease angle" in decision["advisor_rationale"]
+
+
+def test_codex_advisor_changes_g1c_only_after_angle_boundary_exhausted() -> None:
+    target = {
+        "data_role": TARGET_ONLY,
+        "case_id": "13-12-48",
+        "case_key": "13-12-48",
+        "target_strength_mpa": 100.0,
+        "source_inp": "13-inp/13-12-48.inp",
+    }
+    sim_records = [
+        {
+            "data_role": CURRENT_SIM,
+            "case_id": "13-12-48",
+            "case_key": "13-12-48",
+            "attempt_id": 1,
+            "angle_deg": 8.0,
+            "g1c": 20.0,
+            "compressive_strength_mpa": 130.0,
+        },
+        {
+            "data_role": CURRENT_SIM,
+            "case_id": "13-12-48",
+            "case_key": "13-12-48",
+            "attempt_id": 2,
+            "angle_deg": 10.0,
+            "g1c": 20.0,
+            "compressive_strength_mpa": 120.0,
+        },
+    ]
+
+    decision = select_strength_candidate(target, sim_records)
+
+    assert decision["status"] == "planned"
+    assert decision["decision_axis"] == "g1c_after_angle_exhausted"
+    assert decision["physical_direction"] == "reduce_strength"
+    assert decision["angle_deg"] == 10.0
+    assert decision["g1c"] < 20.0
+    assert "Angle-only adjustment is exhausted" in decision["advisor_rationale"]
+
+
+def test_max_attempts_uses_codex_model_review_fields() -> None:
+    target = {
+        "data_role": TARGET_ONLY,
+        "case_id": "13-72-48",
+        "case_key": "13-72-48",
+        "target_strength_mpa": 164.17,
+        "source_inp": "13-inp/13-72-48.inp",
+    }
+    sim_records = [
+        {
+            "data_role": CURRENT_SIM,
+            "case_id": "13-72-48",
+            "case_key": "13-72-48",
+            "attempt_id": attempt,
+            "angle_deg": angle,
+            "g1c": 5.0,
+            "compressive_strength_mpa": strength,
+        }
+        for attempt, angle, strength in [(1, 3.0, 240.0), (2, 2.5, 246.0), (3, 3.0, 266.0)]
+    ]
+
+    decision = select_strength_candidate(target, sim_records)
+
+    assert decision["status"] == "max_attempts_reached"
+    assert decision["selected_by"] == "codex_advisor_review"
+    assert decision["decision_axis"] == "model_review"
+    assert decision["physical_direction"] == "reduce_strength"
+    assert decision["needs_model_review"] is True
+    assert "physical_direction_violation" in decision["monotonic_violation"]
+    assert "Historical physical-direction violation" in decision["advisor_rationale"]
 
 
 def test_strength_error_uses_target_denominator() -> None:
@@ -521,6 +630,50 @@ def test_archive_odb_files_moves_odb_and_writes_indexes(workspace_tmp: Path) -> 
     assert rows[0]["size_bytes"] == str(len(b"fake odb bytes"))
     assert len(rows[0]["sha256"]) == 64
     assert Path(rows[0]["archive_path"]).exists()
+
+
+def test_delete_odb_files_deletes_odb_and_writes_index(workspace_tmp: Path) -> None:
+    run_dir = workspace_tmp / "run"
+    case_dir = run_dir / "work" / "cases" / "13-12-24"
+    case_dir.mkdir(parents=True)
+    odb = case_dir / "mc_13_12_24_attempt1.odbprobe"
+    odb.write_bytes(b"fake odb bytes")
+    index_dir = run_dir / "reports"
+    attempt_rows = [
+        {
+            "job_name": "mc_13_12_24_attempt1",
+            "case_id": "13-12-24",
+            "attempt_id": "1",
+            "angle_deg": "2.0",
+            "g1c": "5.0",
+        }
+    ]
+
+    deleted_sources: list[Path] = []
+
+    def fake_delete(src: Path) -> None:
+        deleted_sources.append(src)
+
+    result = delete_odb_files(
+        run_dir,
+        index_dir=index_dir,
+        batch_id="batch_001",
+        attempt_rows=attempt_rows,
+        file_glob="*.odbprobe",
+        delete_file=fake_delete,
+    )
+
+    assert result["deleted_count"] == 1
+    assert result["deleted_bytes"] == len(b"fake odb bytes")
+    assert deleted_sources == [odb]
+    assert Path(result["d_index"]).exists()
+    with Path(result["d_index"]).open("r", encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert rows[0]["case_id"] == "13-12-24"
+    assert rows[0]["attempt_id"] == "1"
+    assert rows[0]["size_bytes"] == str(len(b"fake odb bytes"))
+    assert rows[0]["sha256"] == "skipped_delete_no_archive"
+    assert rows[0]["deletion_policy"] == "delete_no_archive"
 
 
 
@@ -666,6 +819,91 @@ def test_run_calibration_batch_updates_history_and_archives(
     assert rows[0]["compressive_strength_mpa"] == "185.0"
 
 
+def test_append_calibration_history_upgrades_legacy_advisor_header(workspace_tmp: Path) -> None:
+    history_csv = workspace_tmp / "history.csv"
+    legacy_headers = [
+        "data_role",
+        "batch_id",
+        "case_id",
+        "attempt_id",
+        "angle_deg",
+        "g1c",
+        "target_strength_mpa",
+        "compressive_strength_mpa",
+        "error_pct",
+        "accepted",
+        "status",
+        "job_name",
+        "run_dir",
+        "state_json",
+        "summary_json",
+        "curve_csv",
+    ]
+    with history_csv.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(legacy_headers)
+        writer.writerow(
+            [
+                CURRENT_SIM,
+                "batch_old",
+                "13-12-24",
+                "1",
+                "3.0",
+                "5.0",
+                "200.0",
+                "185.0",
+                "7.5",
+                "True",
+                "SOLVED",
+                "old_job",
+                "old_run",
+                "old_state.json",
+                "old_summary.json",
+                "old_curve.csv",
+            ]
+        )
+
+    meso_compression.append_calibration_history(
+        history_csv,
+        [
+            {
+                "data_role": CURRENT_SIM,
+                "batch_id": "batch_new",
+                "case_id": "13-12-36",
+                "attempt_id": 2,
+                "angle_deg": 2.5,
+                "g1c": 15.0,
+                "target_strength_mpa": 210.0,
+                "compressive_strength_mpa": 250.0,
+                "error_pct": 19.047619,
+                "accepted": False,
+                "status": "SOLVED",
+                "selected_by": "advisor_review",
+                "advisor_rationale": "avoid worsening angle direction",
+                "trend_summary": "avoid_angle_decrease",
+                "skipped_candidates": "worsening_direction:2/5:angle_decrease",
+                "job_name": "new_job",
+                "run_dir": "new_run",
+                "state_json": "new_state.json",
+                "summary_json": "new_summary.json",
+                "curve_csv": "new_curve.csv",
+            }
+        ],
+    )
+
+    with history_csv.open("r", encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert rows[0]["job_name"] == "old_job"
+    assert rows[1]["selected_by"] == "advisor_review"
+    assert rows[1]["advisor_rationale"] == "avoid worsening angle direction"
+    assert rows[1]["trend_summary"] == "avoid_angle_decrease"
+    assert rows[1]["job_name"] == "new_job"
+
+    records = meso_compression.read_calibration_history(history_csv)
+    assert records[-1]["selected_by"] == "advisor_review"
+    assert records[-1]["trend_summary"] == "avoid_angle_decrease"
+
+
 def test_calibrate_strength_refreshes_next_candidates_after_execution(
     workspace_tmp: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -727,6 +965,7 @@ def test_calibrate_strength_refreshes_next_candidates_after_execution(
         batch_id="batch_001",
         archive_root=workspace_tmp / "archive",
         no_archive=True,
+        auto_next_candidates=True,
     )
 
     with (output_root / "next_candidates.csv").open("r", encoding="utf-8", newline="") as stream:
@@ -736,6 +975,80 @@ def test_calibrate_strength_refreshes_next_candidates_after_execution(
     assert rows[0]["advisor_rationale"]
     manifest = json.loads((output_root / "calibration_manifest.json").read_text(encoding="utf-8"))
     assert manifest["plan_phase"] == "post_execution_next_batch"
+    assert manifest["last_executed_batch_id"] == "batch_001"
+
+
+def test_calibrate_strength_pauses_next_candidates_after_execution(
+    workspace_tmp: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target_xlsx = workspace_tmp / "targets.xlsx"
+    write_xlsx(
+        target_xlsx,
+        {
+            "Sheet1": [
+                ["group", "dim_a", "dim_b", "ignored", "compression_strength"],
+                [1, 12, 12, 999, 100.0],
+                [1, 12, 24, 999, 200.0],
+            ]
+        },
+    )
+    params_path = workspace_tmp / "params.json"
+    params_path.write_text("{}", encoding="utf-8")
+
+    def fake_run_calibration_batch(**kwargs):
+        candidate = kwargs["candidates"][0]
+        return {
+            "batch_id": kwargs["batch_id"],
+            "history_rows": [
+                {
+                    "data_role": CURRENT_SIM,
+                    "batch_id": kwargs["batch_id"],
+                    "case_id": "13-12-12",
+                    "case_key": "13-12-12",
+                    "attempt_id": candidate["attempt_id"],
+                    "angle_deg": candidate["angle_deg"],
+                    "g1c": candidate["g1c"],
+                    "target_strength_mpa": 100.0,
+                    "compressive_strength_mpa": 100.0,
+                    "error_pct": 0.0,
+                    "accepted": True,
+                    "status": "SOLVED",
+                }
+            ],
+            "archive": None,
+        }
+
+    monkeypatch.setattr(meso_compression, "run_calibration_batch", fake_run_calibration_batch)
+
+    output_root = workspace_tmp / "calibration"
+    meso_compression.calibrate_strength_command(
+        target_xlsx=target_xlsx,
+        reference_summary_xlsx=None,
+        params_json=params_path,
+        current_summary_xlsx=None,
+        current_history_csv=workspace_tmp / "history.csv",
+        output_root=output_root,
+        case_id=None,
+        batch_size=1,
+        max_new_attempts=3,
+        max_batches=1,
+        execute=True,
+        dry_run=False,
+        force=False,
+        batch_id="batch_001",
+        archive_root=workspace_tmp / "archive",
+        no_archive=True,
+    )
+
+    with (output_root / "next_candidates.csv").open("r", encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert rows == []
+    manifest = json.loads((output_root / "calibration_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["plan_phase"] == "post_execution_paused"
+    assert manifest["candidate_count"] == 0
+    assert manifest["candidates"] == []
+    assert manifest["paused_before_candidate_generation"] is True
+    assert manifest["requires_codex_advisor_review"] is True
     assert manifest["last_executed_batch_id"] == "batch_001"
 
 
@@ -834,6 +1147,7 @@ def test_calibration_summary_xlsx_includes_status_and_archive_sheets(workspace_t
                 "best_error_pct": 20.0,
                 "selected_by": "advisor_review",
                 "advisor_rationale": "needs review",
+                "monotonic_violation": "physical_direction_violation: test marker",
                 "needs_model_review": True,
                 "reason": "max_new_attempts_reached_without_acceptance",
             },
@@ -863,7 +1177,13 @@ def test_calibration_summary_xlsx_includes_status_and_archive_sheets(workspace_t
     next_candidates = read_xlsx_rows(paths["xlsx"], sheet_name="next_candidates")
     assert "selected_by" in next_candidates[0]
     assert "advisor_rationale" in next_candidates[0]
-    assert read_xlsx_rows(paths["xlsx"], sheet_name="max_attempts")[1][0] == "13-12-36"
+    assert "decision_axis" in next_candidates[0]
+    assert "physical_direction" in next_candidates[0]
+    assert "monotonic_prior" in next_candidates[0]
+    max_attempts = read_xlsx_rows(paths["xlsx"], sheet_name="max_attempts")
+    assert "monotonic_violation" in max_attempts[0]
+    assert max_attempts[1][0] == "13-12-36"
+    assert any("physical_direction_violation" in str(cell) for cell in max_attempts[1])
     archive_summary = read_xlsx_rows(paths["xlsx"], sheet_name="archive_summary")
     assert archive_summary[0][-1] == "archive_dir"
     assert archive_summary[1][0] == "batch_001"

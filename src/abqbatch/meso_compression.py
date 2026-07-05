@@ -34,13 +34,19 @@ TARGET_ONLY = "TARGET_ONLY"
 REFERENCE_SIM = "REFERENCE_SIM"
 CURRENT_SIM = "CURRENT_SIM"
 SIM_DATA_ROLES = {REFERENCE_SIM, CURRENT_SIM}
-ANGLE_MIN_DEG = 1.0
-ANGLE_MAX_DEG = 3.0
+ANGLE_MIN_DEG = 0.0
+ANGLE_MAX_DEG = 10.0
 G1C_MIN = 5.0
 G1C_MAX = 120.0
 ACCEPTANCE_ERROR_PCT = 15.0
 DEFAULT_MAX_NEW_ATTEMPTS = 3
 DEFAULT_CALIBRATION_BATCH_SIZE = 6
+CODEX_ADVISOR_SELECTED_BY = "codex_advisor_review"
+MONOTONIC_PRIOR = (
+    "Increasing initial misalignment angle lowers compressive strength; "
+    "decreasing G1C lowers compressive strength; decreasing angle or increasing G1C "
+    "raises compressive strength."
+)
 DEFAULT_TARGET_GROUPS = {0: "QJ", 1: "13", 2: "132"}
 DEFAULT_EXCLUDED_CALIBRATION_CASES = {
     "qj-24-24",
@@ -1715,6 +1721,10 @@ def read_calibration_history(path: Path) -> list[dict[str, Any]]:
                     "status": row.get("status"),
                     "selected_by": row.get("selected_by"),
                     "advisor_rationale": row.get("advisor_rationale"),
+                    "decision_axis": row.get("decision_axis"),
+                    "physical_direction": row.get("physical_direction"),
+                    "monotonic_prior": row.get("monotonic_prior"),
+                    "monotonic_violation": row.get("monotonic_violation"),
                     "trend_summary": row.get("trend_summary"),
                     "skipped_candidates": row.get("skipped_candidates"),
                     "job_name": row.get("job_name"),
@@ -1743,6 +1753,10 @@ def append_calibration_history(path: Path, rows: list[dict[str, Any]]) -> None:
         "status",
         "selected_by",
         "advisor_rationale",
+        "decision_axis",
+        "physical_direction",
+        "monotonic_prior",
+        "monotonic_violation",
         "trend_summary",
         "skipped_candidates",
         "job_name",
@@ -1752,6 +1766,22 @@ def append_calibration_history(path: Path, rows: list[dict[str, Any]]) -> None:
         "curve_csv",
     ]
     exists = path.exists()
+    if exists:
+        with path.open("r", encoding="utf-8-sig", newline="") as stream:
+            reader = csv.reader(stream)
+            existing_headers = next(reader, [])
+            existing_rows = list(reader)
+        if existing_headers != headers:
+            normalized_rows: list[dict[str, Any]] = []
+            for row in existing_rows:
+                if len(row) == len(headers):
+                    normalized_rows.append(dict(zip(headers, row, strict=True)))
+                    continue
+                normalized_rows.append(dict(zip(existing_headers, row, strict=False)))
+            with path.open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=headers, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(normalized_rows)
     with path.open("a", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=headers, extrasaction="ignore")
         if not exists:
@@ -1808,76 +1838,6 @@ def _linear_inverse(target_strength: float, x1: float, y1: float, x2: float, y2:
     return x1 + (target_strength - y1) * (x2 - x1) / (y2 - y1)
 
 
-def _candidate_from_sim_bracket(
-    records: list[dict[str, Any]],
-    *,
-    target_strength: float,
-) -> dict[str, Any] | None:
-    by_g1c: dict[float, list[dict[str, Any]]] = {}
-    by_angle: dict[float, list[dict[str, Any]]] = {}
-    for record in records:
-        by_g1c.setdefault(_same_param(record["g1c"]), []).append(record)
-        by_angle.setdefault(_same_param(record["angle_deg"]), []).append(record)
-
-    candidates: list[dict[str, Any]] = []
-    for g1c, group in by_g1c.items():
-        ordered = sorted(group, key=lambda item: float(item["angle_deg"]))
-        for left, right in zip(ordered, ordered[1:], strict=False):
-            y1 = float(left["compressive_strength_mpa"])
-            y2 = float(right["compressive_strength_mpa"])
-            if not _brackets(target_strength, y1, y2):
-                continue
-            angle = _linear_inverse(
-                target_strength, float(left["angle_deg"]), y1, float(right["angle_deg"]), y2
-            )
-            angle = _clamp(angle, ANGLE_MIN_DEG, ANGLE_MAX_DEG)
-            candidates.append(
-                {
-                    "angle_deg": angle,
-                    "g1c": float(g1c),
-                    "reason": "same_g1c_strength_bracket",
-                    "span_mpa": abs(y2 - y1),
-                    "selected_by": "linear_interpolation",
-                    "advisor_rationale": (
-                        "target is bracketed by real simulation strengths at constant G1C; "
-                        "angle was linearly interpolated"
-                    ),
-                }
-            )
-    for angle, group in by_angle.items():
-        ordered = sorted(group, key=lambda item: float(item["g1c"]))
-        for left, right in zip(ordered, ordered[1:], strict=False):
-            y1 = float(left["compressive_strength_mpa"])
-            y2 = float(right["compressive_strength_mpa"])
-            g1c1 = float(left["g1c"])
-            g1c2 = float(right["g1c"])
-            if g1c1 <= 0 or g1c2 <= 0 or not _brackets(target_strength, y1, y2):
-                continue
-            log_g1c = _linear_inverse(target_strength, math.log(g1c1), y1, math.log(g1c2), y2)
-            g1c = _clamp(math.exp(log_g1c), G1C_MIN, G1C_MAX)
-            candidates.append(
-                {
-                    "angle_deg": float(angle),
-                    "g1c": g1c,
-                    "reason": "same_angle_log_g1c_strength_bracket",
-                    "span_mpa": abs(y2 - y1),
-                    "selected_by": "linear_interpolation",
-                    "advisor_rationale": (
-                        "target is bracketed by real simulation strengths at constant angle; "
-                        "G1C was interpolated in log space"
-                    ),
-                }
-            )
-    for candidate in sorted(
-        candidates, key=lambda item: (item["span_mpa"], item["g1c"], item["angle_deg"])
-    ):
-        candidate["angle_deg"] = round(float(candidate["angle_deg"]), 4)
-        candidate["g1c"] = round(float(candidate["g1c"]), 4)
-        if not _sampled(records, candidate["angle_deg"], candidate["g1c"]):
-            return candidate
-    return None
-
-
 def _record_error(record: dict[str, Any], target_strength: float) -> float:
     return strength_error_pct(
         target_strength_mpa=target_strength,
@@ -1885,132 +1845,523 @@ def _record_error(record: dict[str, Any], target_strength: float) -> float:
     )
 
 
-def _attempt_sort_key(record: dict[str, Any]) -> tuple[int, float, float, str]:
-    role_rank = 1 if record.get("data_role") == CURRENT_SIM else 0
-    attempt = _coerce_float(record.get("attempt_id"))
-    attempt_rank = attempt if attempt is not None else 0.0
-    return (role_rank, attempt_rank, float(record["angle_deg"]), str(record.get("job_name") or ""))
+def _candidate_physics_fields(
+    *,
+    physical_direction: str | None,
+    decision_axis: str,
+    rationale: str,
+    reason: str,
+    trend_summary: str | None = None,
+    skipped_candidates: str | None = None,
+    monotonic_violation: str | bool | None = None,
+) -> dict[str, Any]:
+    return {
+        "reason": reason,
+        "selected_by": CODEX_ADVISOR_SELECTED_BY,
+        "advisor_rationale": rationale,
+        "decision_axis": decision_axis,
+        "physical_direction": physical_direction,
+        "monotonic_prior": MONOTONIC_PRIOR,
+        "monotonic_violation": monotonic_violation,
+        "trend_summary": trend_summary,
+        "skipped_candidates": skipped_candidates,
+    }
 
 
-def _trend_worsening_directions(
-    records: list[dict[str, Any]], *, target_strength: float
-) -> set[tuple[str, str]]:
-    current_records = [record for record in records if record.get("data_role") == CURRENT_SIM]
-    ordered = sorted(current_records, key=_attempt_sort_key)
-    worsening: set[tuple[str, str]] = set()
-    for previous, current in zip(ordered, ordered[1:], strict=False):
-        previous_error = _record_error(previous, target_strength)
-        current_error = _record_error(current, target_strength)
-        if current_error <= previous_error + 1e-9:
-            continue
-        previous_angle = float(previous["angle_deg"])
-        current_angle = float(current["angle_deg"])
-        previous_g1c = float(previous["g1c"])
-        current_g1c = float(current["g1c"])
-        if abs(previous_g1c - current_g1c) <= 1e-6 and abs(previous_angle - current_angle) > 1e-6:
-            direction = "increase" if current_angle > previous_angle else "decrease"
-            worsening.add(("angle", direction))
-        if abs(previous_angle - current_angle) <= 1e-6 and abs(previous_g1c - current_g1c) > 1e-6:
-            direction = "increase" if current_g1c > previous_g1c else "decrease"
-            worsening.add(("g1c", direction))
-    return worsening
+def _best_record(records: list[dict[str, Any]], target_strength: float) -> dict[str, Any]:
+    return min(records, key=lambda item: _record_error(item, target_strength))
 
 
-def _movement_direction(
-    from_record: dict[str, Any], angle: float, g1c: float
-) -> list[tuple[str, str]]:
-    movement: list[tuple[str, str]] = []
-    from_angle = float(from_record["angle_deg"])
-    from_g1c = float(from_record["g1c"])
-    if abs(angle - from_angle) > 1e-6:
-        movement.append(("angle", "increase" if angle > from_angle else "decrease"))
-    if abs(g1c - from_g1c) > 1e-6:
-        movement.append(("g1c", "increase" if g1c > from_g1c else "decrease"))
-    return movement
+def _physical_direction(best_strength: float, target_strength: float) -> str:
+    return "reduce_strength" if best_strength > target_strength else "increase_strength"
 
 
-def _fallback_grid(
-    best_strength: float, target_strength: float
-) -> tuple[str, list[tuple[float, float]]]:
-    if best_strength > target_strength:
-        return (
-            "nearest_sim_above_target_reduce_strength",
-            [(3.0, 5.0), (2.5, 5.0), (2.0, 5.0), (3.0, 15.0), (2.0, 15.0), (1.0, 5.0)],
-        )
-    return (
-        "nearest_sim_below_target_raise_strength",
-        [(1.0, 120.0), (1.0, 80.0), (1.5, 120.0), (1.0, 60.0), (2.0, 120.0), (1.0, 30.0)],
+def _angle_direction_for_strength(physical_direction: str) -> str:
+    return "increase" if physical_direction == "reduce_strength" else "decrease"
+
+
+def _g1c_direction_for_strength(physical_direction: str) -> str:
+    return "decrease" if physical_direction == "reduce_strength" else "increase"
+
+
+def _direction_labels(physical_direction: str) -> tuple[str, str, str]:
+    if physical_direction == "reduce_strength":
+        return "sim_above_target", "increase angle", "decrease G1C"
+    return "sim_below_target", "decrease angle", "increase G1C"
+
+
+def _same_g1c_records(records: list[dict[str, Any]], g1c: float) -> list[dict[str, Any]]:
+    return sorted(
+        [record for record in records if abs(float(record["g1c"]) - g1c) <= 1e-6],
+        key=lambda item: float(item["angle_deg"]),
     )
+
+
+def _angle_monotonic_anomaly(records: list[dict[str, Any]]) -> str | None:
+    by_g1c: dict[float, list[dict[str, Any]]] = {}
+    for record in records:
+        by_g1c.setdefault(_same_param(record["g1c"]), []).append(record)
+    anomalies: list[str] = []
+    for g1c, group in sorted(by_g1c.items()):
+        ordered = sorted(group, key=lambda item: float(item["angle_deg"]))
+        for left, right in zip(ordered, ordered[1:], strict=False):
+            left_strength = float(left["compressive_strength_mpa"])
+            right_strength = float(right["compressive_strength_mpa"])
+            if right_strength > left_strength + max(1.0, 0.01 * abs(left_strength)):
+                anomalies.append(
+                    f"G1C={g1c:g}: strength rose from {left_strength:.3f} to "
+                    f"{right_strength:.3f} as angle increased "
+                    f"{float(left['angle_deg']):g}->{float(right['angle_deg']):g}"
+                )
+    return "; ".join(anomalies) if anomalies else None
+
+
+def _record_sequence_key(record: dict[str, Any]) -> tuple[int, int, int, str]:
+    role_order = 0 if record.get("data_role") == REFERENCE_SIM else 1
+    history_row = _coerce_int(record.get("history_row"))
+    attempt_id = _coerce_int(record.get("attempt_id"))
+    return (
+        role_order,
+        history_row if history_row is not None else 10**9,
+        attempt_id if attempt_id is not None else 10**9,
+        str(record.get("batch_id") or ""),
+    )
+
+
+def _historical_physical_direction_violation(
+    records: list[dict[str, Any]], target_strength: float
+) -> str | None:
+    usable = [
+        record
+        for record in records
+        if record.get("compressive_strength_mpa") is not None
+        and record.get("angle_deg") is not None
+        and record.get("g1c") is not None
+    ]
+    ordered = sorted(usable, key=_record_sequence_key)
+    violations: list[str] = []
+    previous: dict[str, Any] | None = None
+    for current in ordered:
+        if previous is None:
+            previous = current
+            continue
+        previous_strength = float(previous["compressive_strength_mpa"])
+        previous_angle = float(previous["angle_deg"])
+        previous_g1c = float(previous["g1c"])
+        current_angle = float(current["angle_deg"])
+        current_g1c = float(current["g1c"])
+        previous_attempt = previous.get("attempt_id") or previous.get("data_role") or "reference"
+        current_attempt = current.get("attempt_id") or current.get("data_role") or "current"
+        if previous_strength > target_strength:
+            if current_angle < previous_angle - 1e-6:
+                violations.append(
+                    "physical_direction_violation: sim_above_target required increasing angle, "
+                    f"but angle changed {previous_angle:g}->{current_angle:g} "
+                    f"between {previous_attempt} and {current_attempt}"
+                )
+            if current_g1c > previous_g1c + 1e-6:
+                violations.append(
+                    "physical_direction_violation: sim_above_target required not increasing G1C, "
+                    f"but G1C changed {previous_g1c:g}->{current_g1c:g} "
+                    f"between {previous_attempt} and {current_attempt}"
+                )
+        elif previous_strength < target_strength:
+            if current_angle > previous_angle + 1e-6:
+                violations.append(
+                    "physical_direction_violation: sim_below_target required decreasing angle, "
+                    f"but angle changed {previous_angle:g}->{current_angle:g} "
+                    f"between {previous_attempt} and {current_attempt}"
+                )
+            if current_g1c < previous_g1c - 1e-6:
+                violations.append(
+                    "physical_direction_violation: sim_below_target required not decreasing G1C, "
+                    f"but G1C changed {previous_g1c:g}->{current_g1c:g} "
+                    f"between {previous_attempt} and {current_attempt}"
+                )
+        previous = current
+    if not violations:
+        return None
+    return "; ".join(dict.fromkeys(violations))
+
+
+def _unique_bounded_values(*values: float, lower: float, upper: float) -> list[float]:
+    result: list[float] = []
+    for value in values:
+        bounded = round(_clamp(value, lower, upper), 4)
+        if all(abs(existing - bounded) > 1e-6 for existing in result):
+            result.append(bounded)
+    return result
+
+
+def _unique_candidate_angles(*values: float) -> list[float]:
+    return _unique_bounded_values(*values, lower=ANGLE_MIN_DEG, upper=ANGLE_MAX_DEG)
+
+
+def _angle_space_remaining(
+    records: list[dict[str, Any]], *, best_angle: float, g1c: float, direction: str
+) -> bool:
+    if direction == "increase":
+        return best_angle < ANGLE_MAX_DEG - 1e-6 and any(
+            not _sampled(records, angle, g1c)
+            for angle in _unique_candidate_angles(
+                ANGLE_MAX_DEG,
+                best_angle + 0.5 * (ANGLE_MAX_DEG - best_angle),
+                best_angle + 2.0,
+                best_angle + 1.0,
+            )
+            if angle > best_angle + 1e-6
+        )
+    return best_angle > ANGLE_MIN_DEG + 1e-6 and any(
+        not _sampled(records, angle, g1c)
+        for angle in _unique_candidate_angles(
+            ANGLE_MIN_DEG,
+            best_angle - 0.5 * (best_angle - ANGLE_MIN_DEG),
+            best_angle - 2.0,
+            best_angle - 1.0,
+        )
+        if angle < best_angle - 1e-6
+    )
+
+
+def _angle_only_bracket_candidate(
+    records: list[dict[str, Any]],
+    *,
+    target_strength: float,
+) -> dict[str, Any] | None:
+    best = _best_record(records, target_strength)
+    best_strength = float(best["compressive_strength_mpa"])
+    best_angle = float(best["angle_deg"])
+    best_g1c = float(best["g1c"])
+    physical_direction = _physical_direction(best_strength, target_strength)
+    angle_direction = _angle_direction_for_strength(physical_direction)
+    bias_label, angle_action, _ = _direction_labels(physical_direction)
+    historical_violation = _historical_physical_direction_violation(records, target_strength)
+    violation_note = (
+        f" Historical physical-direction violation recorded: {historical_violation}."
+        if historical_violation
+        else ""
+    )
+    candidates: list[dict[str, Any]] = []
+    ordered = _same_g1c_records(records, best_g1c)
+    for left, right in zip(ordered, ordered[1:], strict=False):
+        y1 = float(left["compressive_strength_mpa"])
+        y2 = float(right["compressive_strength_mpa"])
+        if y2 >= y1 - 1e-9:
+            continue
+        if not _brackets(target_strength, y1, y2):
+            continue
+        angle = _linear_inverse(
+            target_strength, float(left["angle_deg"]), y1, float(right["angle_deg"]), y2
+        )
+        angle = round(_clamp(angle, ANGLE_MIN_DEG, ANGLE_MAX_DEG), 4)
+        if angle_direction == "increase" and angle <= best_angle + 1e-6:
+            continue
+        if angle_direction == "decrease" and angle >= best_angle - 1e-6:
+            continue
+        if _sampled(records, angle, best_g1c):
+            continue
+        span = abs(y2 - y1)
+        rationale = (
+            f"Codex advisor review: {bias_label}; kept G1C fixed at {best_g1c:g} "
+            f"because angle has priority and same-G1C real simulations bracket the target. "
+            f"Selected angle={angle:g} by angle-only interpolation between actual simulation "
+            f"points; physical direction is to {angle_action}.{violation_note} "
+            "G1C is not adjusted."
+        )
+        candidates.append(
+            {
+                "angle_deg": angle,
+                "g1c": round(best_g1c, 4),
+                "span_mpa": span,
+                **_candidate_physics_fields(
+                    physical_direction=physical_direction,
+                    decision_axis="angle_only",
+                    rationale=rationale,
+                    reason="same_g1c_angle_only_strength_bracket",
+                    trend_summary="angle_only_bracket",
+                    monotonic_violation=historical_violation,
+                ),
+            }
+        )
+    return min(
+        candidates,
+        key=lambda item: (item["span_mpa"], item["g1c"], item["angle_deg"]),
+        default=None,
+    )
+
+
+def _angle_only_advisor_candidate(
+    records: list[dict[str, Any]],
+    *,
+    target_strength: float,
+) -> dict[str, Any] | None:
+    best = _best_record(records, target_strength)
+    best_error = _record_error(best, target_strength)
+    best_strength = float(best["compressive_strength_mpa"])
+    best_angle = float(best["angle_deg"])
+    best_g1c = float(best["g1c"])
+    physical_direction = _physical_direction(best_strength, target_strength)
+    angle_direction = _angle_direction_for_strength(physical_direction)
+    bias_label, angle_action, _ = _direction_labels(physical_direction)
+    same_g1c = _same_g1c_records(records, best_g1c)
+    skipped: list[str] = []
+    historical_violation = _historical_physical_direction_violation(records, target_strength)
+    violation_note = (
+        f" Historical physical-direction violation recorded: {historical_violation}."
+        if historical_violation
+        else ""
+    )
+
+    anomaly = _angle_monotonic_anomaly(same_g1c)
+    if anomaly:
+        rationale = (
+            f"Codex advisor review: {bias_label}; angle-only data violate the monotonic prior "
+            f"({anomaly}). Do not hide this as convergence; mark for model review before "
+            "changing G1C."
+        )
+        return {
+            "status": "model_review_required",
+            "current_attempts": sum(
+                1 for record in records if record.get("data_role") == CURRENT_SIM
+            ),
+            "best_error_pct": round(best_error, 6),
+            "needs_model_review": True,
+            **_candidate_physics_fields(
+                physical_direction=physical_direction,
+                decision_axis="model_review",
+                rationale=rationale,
+                reason="angle_monotonicity_anomaly",
+                trend_summary="angle_monotonicity_anomaly",
+                monotonic_violation=anomaly,
+            ),
+        }
+
+    predicted_angle: float | None = None
+    projection_note = ""
+    if len(same_g1c) >= 2:
+        slope, intercept, r2 = _linear_regression_slope(
+            [
+                (float(record["angle_deg"]), float(record["compressive_strength_mpa"]))
+                for record in same_g1c
+            ]
+        )
+        if slope is not None and slope < -1e-9:
+            predicted_angle = (target_strength - intercept) / slope
+            projection_note = (
+                f" angle-only regression at G1C={best_g1c:g} gives slope={slope:.3f} "
+                f"MPa/deg, r2={r2:.3f}, predicted target angle={predicted_angle:.3f}."
+            )
+        else:
+            rationale = (
+                f"Codex advisor review: {bias_label}; available same-G1C points do not show the "
+                "expected negative strength-vs-angle trend, so the case needs model review before "
+                "changing G1C."
+            )
+            return {
+                "status": "model_review_required",
+                "current_attempts": sum(
+                1 for record in records if record.get("data_role") == CURRENT_SIM
+            ),
+                "best_error_pct": round(best_error, 6),
+                "needs_model_review": True,
+                **_candidate_physics_fields(
+                    physical_direction=physical_direction,
+                    decision_axis="model_review",
+                    rationale=rationale,
+                    reason="angle_trend_not_predictive",
+                    trend_summary="angle_trend_not_predictive",
+                    monotonic_violation=True,
+                ),
+            }
+
+    boundary = ANGLE_MAX_DEG if angle_direction == "increase" else ANGLE_MIN_DEG
+    if predicted_angle is None:
+        preferred_angles = _unique_candidate_angles(
+            boundary,
+            best_angle + (0.5 * (boundary - best_angle)),
+            best_angle + (2.0 if angle_direction == "increase" else -2.0),
+            best_angle + (1.0 if angle_direction == "increase" else -1.0),
+        )
+        projection_note = " no same-G1C bracket exists, so this is an angle-only exploration point."
+    else:
+        preferred_angles = _unique_candidate_angles(
+            predicted_angle,
+            boundary,
+            best_angle + (0.5 * (boundary - best_angle)),
+            best_angle + (2.0 if angle_direction == "increase" else -2.0),
+            best_angle + (1.0 if angle_direction == "increase" else -1.0),
+        )
+
+    for angle in preferred_angles:
+        if angle_direction == "increase" and angle <= best_angle + 1e-6:
+            skipped.append(f"wrong_or_no_angle_increase:{angle:g}/{best_g1c:g}")
+            continue
+        if angle_direction == "decrease" and angle >= best_angle - 1e-6:
+            skipped.append(f"wrong_or_no_angle_decrease:{angle:g}/{best_g1c:g}")
+            continue
+        if _sampled(records, angle, best_g1c):
+            skipped.append(f"sampled:{angle:g}/{best_g1c:g}")
+            continue
+        rationale = (
+            f"Codex advisor review: {bias_label}; best real point is "
+            f"strength={best_strength:.3f} MPa "
+            f"at angle={best_angle:g}, G1C={best_g1c:g}, error={best_error:.3f}%. "
+            f"Physics requires {angle_action} and keeping G1C fixed while angle has room."
+            f"{projection_note} Selected angle={angle:g}, G1C={best_g1c:g};{violation_note} "
+            "G1C is not adjusted because angle-only space remains available."
+        )
+        return {
+            "angle_deg": angle,
+            "g1c": round(best_g1c, 4),
+            **_candidate_physics_fields(
+                physical_direction=physical_direction,
+                decision_axis="angle_only",
+                rationale=rationale,
+                reason="angle_only_codex_advisor_review",
+                trend_summary="angle_only_physical_direction",
+                skipped_candidates=";".join(skipped),
+                monotonic_violation=historical_violation,
+            ),
+        }
+
+    return None
+
+
+def _g1c_after_angle_exhausted_candidate(
+    records: list[dict[str, Any]],
+    *,
+    target_strength: float,
+) -> dict[str, Any] | None:
+    best = _best_record(records, target_strength)
+    best_error = _record_error(best, target_strength)
+    best_strength = float(best["compressive_strength_mpa"])
+    best_angle = float(best["angle_deg"])
+    best_g1c = float(best["g1c"])
+    physical_direction = _physical_direction(best_strength, target_strength)
+    angle_direction = _angle_direction_for_strength(physical_direction)
+    g1c_direction = _g1c_direction_for_strength(physical_direction)
+    bias_label, angle_action, g1c_action = _direction_labels(physical_direction)
+    historical_violation = _historical_physical_direction_violation(records, target_strength)
+    violation_note = (
+        f" Historical physical-direction violation recorded: {historical_violation}."
+        if historical_violation
+        else ""
+    )
+
+    if _angle_space_remaining(
+        records, best_angle=best_angle, g1c=best_g1c, direction=angle_direction
+    ):
+        return None
+
+    angle_at_boundary = (
+        best_angle >= ANGLE_MAX_DEG - 1e-6
+        if angle_direction == "increase"
+        else best_angle <= ANGLE_MIN_DEG + 1e-6
+    )
+    if not angle_at_boundary:
+        return None
+
+    if g1c_direction == "decrease":
+        if best_g1c <= G1C_MIN + 1e-6:
+            return None
+        g1c_options = [G1C_MIN, max(G1C_MIN, best_g1c * 0.5), max(G1C_MIN, best_g1c - 10.0)]
+    else:
+        if best_g1c >= G1C_MAX - 1e-6:
+            return None
+        g1c_options = [G1C_MAX, min(G1C_MAX, best_g1c * 2.0), min(G1C_MAX, best_g1c + 10.0)]
+
+    for g1c in _unique_bounded_values(*g1c_options, lower=G1C_MIN, upper=G1C_MAX):
+        if abs(g1c - best_g1c) <= 1e-6 or _sampled(records, best_angle, g1c):
+            continue
+        rationale = (
+            f"Codex advisor review: {bias_label}; best real point is "
+            f"strength={best_strength:.3f} MPa "
+            f"at angle={best_angle:g}, G1C={best_g1c:g}, error={best_error:.3f}%. "
+            f"Angle-only adjustment is exhausted because angle is at the "
+            f"{best_angle:g} deg boundary "
+            "and no unsampled physical-direction angle remains."
+            f"{violation_note} Physics now allows {g1c_action}; "
+            f"selected angle={best_angle:g}, G1C={g1c:g}."
+        )
+        return {
+            "angle_deg": round(best_angle, 4),
+            "g1c": g1c,
+            **_candidate_physics_fields(
+                physical_direction=physical_direction,
+                decision_axis="g1c_after_angle_exhausted",
+                rationale=rationale,
+                reason="g1c_after_angle_exhausted_codex_advisor_review",
+                trend_summary="angle_boundary_then_g1c",
+                monotonic_violation=historical_violation,
+            ),
+        }
+    return None
 
 
 def _advisor_candidate(
     records: list[dict[str, Any]], *, target_strength: float
 ) -> dict[str, Any] | None:
     if not records:
-        return {
-            "angle_deg": ANGLE_MAX_DEG,
-            "g1c": G1C_MIN,
-            "reason": "initial_exploration",
-            "selected_by": "exploration",
-            "advisor_rationale": (
-                "no real simulation points exist for this case; "
-                "selected a bounded exploration point"
-            ),
-            "trend_summary": "no_case_history",
-        }
-    best = min(records, key=lambda item: _record_error(item, target_strength))
-    best_error = _record_error(best, target_strength)
-    best_strength = float(best["compressive_strength_mpa"])
-    worsening = _trend_worsening_directions(records, target_strength=target_strength)
-    reason, grid = _fallback_grid(best_strength, target_strength)
-    skipped: list[str] = []
-    for angle, g1c in grid:
-        if _sampled(records, angle, g1c):
-            skipped.append(f"sampled:{angle:g}/{g1c:g}")
-            continue
-        movement = _movement_direction(best, angle, g1c)
-        harmful = [item for item in movement if item in worsening]
-        if harmful:
-            skipped.append(
-                f"worsening_direction:{angle:g}/{g1c:g}:"
-                + ",".join(f"{axis}_{direction}" for axis, direction in harmful)
-            )
-            continue
-        trend_text = (
-            "no_worsening_direction_detected"
-            if not worsening
-            else "avoid_" + ",".join(f"{axis}_{direction}" for axis, direction in sorted(worsening))
+        rationale = (
+            "Codex advisor review: no real simulation points exist for this case. Start with an "
+            "angle-only exploration at the middle of the allowed 0-10 deg range and baseline G1C; "
+            "G1C is not adjusted until angle evidence exists."
         )
         return {
-            "angle_deg": angle,
-            "g1c": g1c,
-            "reason": reason,
-            "selected_by": "advisor_review",
-            "advisor_rationale": (
-                f"best real point error is {best_error:.3f}% at "
-                f"angle={float(best['angle_deg']):g}, G1C={float(best['g1c']):g}; "
-                f"{trend_text}; selected first unsampled candidate that does not continue "
-                "a worsening direction"
+            "angle_deg": 5.0,
+            "g1c": G1C_MIN,
+            **_candidate_physics_fields(
+                physical_direction=None,
+                decision_axis="angle_only",
+                rationale=rationale,
+                reason="initial_angle_only_exploration",
+                trend_summary="no_case_history",
             ),
-            "trend_summary": trend_text,
-            "skipped_candidates": ";".join(skipped),
         }
-    for angle, g1c in grid:
-        if not _sampled(records, angle, g1c):
-            return {
-                "angle_deg": angle,
-                "g1c": g1c,
-                "reason": "advisor_exploration_after_trend_constraints",
-                "selected_by": "exploration",
-                "advisor_rationale": (
-                    "all preferred unsampled candidates continued a worsening direction; "
-                    "selected a remaining bounded exploration point and flagged the trend"
-                ),
-                "trend_summary": "trend_constraints_exhausted",
-                "skipped_candidates": ";".join(skipped),
-            }
-    return None
 
+    angle_candidate = _angle_only_advisor_candidate(records, target_strength=target_strength)
+    if angle_candidate is not None:
+        return angle_candidate
+
+    g1c_candidate = _g1c_after_angle_exhausted_candidate(records, target_strength=target_strength)
+    if g1c_candidate is not None:
+        return g1c_candidate
+
+    best = _best_record(records, target_strength)
+    best_error = _record_error(best, target_strength)
+    physical_direction = _physical_direction(
+        float(best["compressive_strength_mpa"]), target_strength
+    )
+    bias_label, angle_action, g1c_action = _direction_labels(physical_direction)
+    historical_violation = _historical_physical_direction_violation(records, target_strength)
+    violation_note = (
+        f" Historical physical-direction violation recorded: {historical_violation}."
+        if historical_violation
+        else ""
+    )
+    rationale = (
+        f"Codex advisor review: {bias_label}; no unsampled candidate satisfies the "
+        "physical direction "
+        f"constraints ({angle_action} first, {g1c_action} only after angle exhaustion)."
+        f"{violation_note} Mark for model "
+        "review instead of generating an opposite-direction fallback."
+    )
+    return {
+        "status": "model_review_required",
+        "current_attempts": sum(
+                1 for record in records if record.get("data_role") == CURRENT_SIM
+            ),
+        "best_error_pct": round(best_error, 6),
+        "needs_model_review": True,
+        **_candidate_physics_fields(
+            physical_direction=physical_direction,
+            decision_axis="model_review",
+            rationale=rationale,
+            reason="no_physical_direction_candidate",
+            trend_summary="physical_direction_constraints_exhausted",
+            monotonic_violation=historical_violation,
+        ),
+    }
 
 def select_strength_candidate(
     target: dict[str, Any],
@@ -2049,18 +2400,27 @@ def select_strength_candidate(
             "advisor_rationale": (
                 "existing actual simulation point is within the 15% target-strength error limit"
             ),
+            "decision_axis": "accepted_existing_sim",
+            "physical_direction": None,
+            "monotonic_prior": MONOTONIC_PRIOR,
+            "monotonic_violation": None,
         }
 
     current_attempts = sum(1 for record in records if record.get("data_role") == CURRENT_SIM)
     if current_attempts >= max_new_attempts:
         best_error = None
+        physical_direction = None
+        historical_violation = _historical_physical_direction_violation(records, target_strength)
+        violation_note = (
+            f" Historical physical-direction violation recorded: {historical_violation}."
+            if historical_violation
+            else ""
+        )
         if records:
-            best_error = min(
-                strength_error_pct(
-                    target_strength_mpa=target_strength,
-                    simulated_strength_mpa=float(record["compressive_strength_mpa"]),
-                )
-                for record in records
+            best = _best_record(records, target_strength)
+            best_error = _record_error(best, target_strength)
+            physical_direction = _physical_direction(
+                float(best["compressive_strength_mpa"]), target_strength
             )
         return {
             "status": "max_attempts_reached",
@@ -2070,28 +2430,49 @@ def select_strength_candidate(
             "current_attempts": current_attempts,
             "best_error_pct": round(best_error, 6) if best_error is not None else None,
             "reason": "max_new_attempts_reached_without_acceptance",
-            "selected_by": "advisor_review",
+            "selected_by": CODEX_ADVISOR_SELECTED_BY,
             "advisor_rationale": (
-                "case reached the maximum number of current calibration attempts without "
-                "meeting the 15% acceptance limit; mark for model review"
+                "Codex advisor review: case reached the maximum number of current calibration "
+                "attempts without meeting the 15% acceptance limit; mark needs_model_review "
+                f"instead of generating another fallback candidate.{violation_note}"
             ),
+            "decision_axis": "model_review",
+            "physical_direction": physical_direction,
+            "monotonic_prior": MONOTONIC_PRIOR,
+            "monotonic_violation": historical_violation,
             "needs_model_review": True,
         }
 
-    candidate = _candidate_from_sim_bracket(records, target_strength=target_strength)
+    candidate = (
+        _angle_only_bracket_candidate(records, target_strength=target_strength)
+        if records
+        else None
+    )
     if candidate is None:
         candidate = _advisor_candidate(records, target_strength=target_strength)
     if candidate is None:
         return {
-            "status": "no_unsampled_candidate",
+            "status": "model_review_required",
             "case_id": target["case_id"],
             "case_key": target["case_key"],
             "target_strength_mpa": target_strength,
             "current_attempts": current_attempts,
-            "reason": "exploration_grid_exhausted",
-            "selected_by": "advisor_review",
-            "advisor_rationale": "no unsampled bounded candidate remains after advisor review",
+            "reason": "no_physical_direction_candidate",
+            "selected_by": CODEX_ADVISOR_SELECTED_BY,
+            "advisor_rationale": "no candidate satisfies the physical direction constraints",
+            "decision_axis": "model_review",
+            "physical_direction": None,
+            "monotonic_prior": MONOTONIC_PRIOR,
+            "monotonic_violation": None,
             "needs_model_review": True,
+        }
+    if candidate.get("status") == "model_review_required":
+        return {
+            "status": "model_review_required",
+            "case_id": target["case_id"],
+            "case_key": target["case_key"],
+            "target_strength_mpa": target_strength,
+            **candidate,
         }
     attempt_id = current_attempts + 1
     return {
@@ -2105,8 +2486,12 @@ def select_strength_candidate(
         "source_inp": target.get("source_inp"),
         "planned_data_role": CURRENT_SIM,
         "reason": candidate["reason"],
-        "selected_by": candidate.get("selected_by", "advisor_review"),
+        "selected_by": candidate.get("selected_by", CODEX_ADVISOR_SELECTED_BY),
         "advisor_rationale": candidate.get("advisor_rationale"),
+        "decision_axis": candidate.get("decision_axis"),
+        "physical_direction": candidate.get("physical_direction"),
+        "monotonic_prior": candidate.get("monotonic_prior"),
+        "monotonic_violation": candidate.get("monotonic_violation"),
         "trend_summary": candidate.get("trend_summary"),
         "skipped_candidates": candidate.get("skipped_candidates"),
         "current_attempts": current_attempts,
@@ -2323,6 +2708,10 @@ def write_calibration_outputs(
         "planned_data_role",
         "selected_by",
         "advisor_rationale",
+        "decision_axis",
+        "physical_direction",
+        "monotonic_prior",
+        "monotonic_violation",
         "trend_summary",
         "reason",
         "source_inp",
@@ -2341,6 +2730,9 @@ def write_calibration_outputs(
         "accepted_g1c",
         "selected_by",
         "advisor_rationale",
+        "decision_axis",
+        "physical_direction",
+        "monotonic_prior",
         "reason",
     ]
     max_attempt_headers = [
@@ -2350,6 +2742,10 @@ def write_calibration_outputs(
         "best_error_pct",
         "selected_by",
         "advisor_rationale",
+        "decision_axis",
+        "physical_direction",
+        "monotonic_prior",
+        "monotonic_violation",
         "needs_model_review",
         "reason",
     ]
@@ -2440,6 +2836,10 @@ def build_calibration_candidate_params(
             "calibration_data_role": CURRENT_SIM,
             "selected_by": candidate.get("selected_by"),
             "advisor_rationale": candidate.get("advisor_rationale"),
+            "decision_axis": candidate.get("decision_axis"),
+            "physical_direction": candidate.get("physical_direction"),
+            "monotonic_prior": candidate.get("monotonic_prior"),
+            "monotonic_violation": candidate.get("monotonic_violation"),
             "trend_summary": candidate.get("trend_summary"),
         }
     )
@@ -2503,9 +2903,14 @@ def prepare_calibration_candidate(
         run_dir=run_dir,
         force=force,
     )
-    manifest["calibration_candidate"] = {
+    candidate_snapshot = {
         key: value for key, value in candidate.items() if isinstance(value, (str, int, float, bool))
     }
+    manifest["calibration_candidate"] = candidate_snapshot
+    for prepared_case in manifest["cases"]:
+        state = read_case_state(prepared_case)
+        state["calibration_candidate"] = candidate_snapshot
+        write_case_state(prepared_case, state)
     _write_manifest(run_dir, manifest)
     return {
         "candidate": candidate,
@@ -2552,6 +2957,10 @@ def calibration_history_row_from_case(
         "status": state.get("status"),
         "selected_by": candidate.get("selected_by"),
         "advisor_rationale": candidate.get("advisor_rationale"),
+        "decision_axis": candidate.get("decision_axis"),
+        "physical_direction": candidate.get("physical_direction"),
+        "monotonic_prior": candidate.get("monotonic_prior"),
+        "monotonic_violation": candidate.get("monotonic_violation"),
         "trend_summary": candidate.get("trend_summary"),
         "skipped_candidates": candidate.get("skipped_candidates"),
         "job_name": case.get("job_name"),
@@ -2570,6 +2979,7 @@ def run_calibration_batch(
     batch_id: str,
     history_csv: Path,
     archive_root: Path | None = None,
+    delete_odb: bool = False,
     dry_run: bool = False,
     force: bool = False,
 ) -> dict[str, Any]:
@@ -2616,7 +3026,10 @@ def run_calibration_batch(
                     }
                 )
     append_calibration_history(history_csv, history_rows)
+    if archive_root is not None and delete_odb:
+        raise ValueError("archive_root and delete_odb are mutually exclusive")
     archive_result = None
+    odb_cleanup_result = None
     if archive_root is not None:
         raw_archive_result = archive_odb_files(
             batch_dir,
@@ -2629,6 +3042,17 @@ def run_calibration_batch(
             key: str(value) if isinstance(value, Path) else value
             for key, value in raw_archive_result.items()
         }
+    elif delete_odb:
+        raw_cleanup_result = delete_odb_files(
+            batch_dir,
+            index_dir=output_root / "archive_indexes",
+            batch_id=batch_id,
+            attempt_rows=attempt_rows,
+        )
+        odb_cleanup_result = {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in raw_cleanup_result.items()
+        }
     result = {
         "batch_id": batch_id,
         "batch_dir": str(batch_dir),
@@ -2637,6 +3061,7 @@ def run_calibration_batch(
         "history_rows": history_rows,
         "attempt_rows": attempt_rows,
         "archive": archive_result,
+        "odb_cleanup": odb_cleanup_result,
     }
     _write_json(output_root / f"{batch_id}_execution_summary.json", result)
     return result
@@ -2720,6 +3145,67 @@ def archive_odb_files(
     }
 
 
+def delete_odb_files(
+    run_dir: Path,
+    *,
+    index_dir: Path,
+    batch_id: str,
+    attempt_rows: list[dict[str, Any]],
+    file_glob: str = "*.odb",
+    delete_file: Callable[[Path], None] | None = None,
+) -> dict[str, Path | int]:
+    index_dir.mkdir(parents=True, exist_ok=True)
+    attempts_by_job = {str(row.get("job_name")): row for row in attempt_rows if row.get("job_name")}
+    rows: list[dict[str, Any]] = []
+    deleted_bytes = 0
+    for odb in sorted(run_dir.rglob(file_glob)):
+        original_path = odb.resolve()
+        job_name = odb.stem
+        attempt = attempts_by_job.get(job_name, {})
+        size = odb.stat().st_size
+        if delete_file is None:
+            odb.unlink()
+            if odb.exists():
+                raise PermissionError(f"ODB delete left source file in place: {odb}")
+        else:
+            delete_file(odb)
+        deleted_bytes += size
+        rows.append(
+            {
+                "deleted_at": _now(),
+                "batch_id": batch_id,
+                "case_id": attempt.get("case_id"),
+                "attempt_id": attempt.get("attempt_id"),
+                "angle_deg": attempt.get("angle_deg"),
+                "g1c": attempt.get("g1c"),
+                "original_path": str(original_path),
+                "size_bytes": size,
+                "sha256": "skipped_delete_no_archive",
+                "job_name": job_name,
+                "deletion_policy": "delete_no_archive",
+            }
+        )
+    headers = [
+        "deleted_at",
+        "batch_id",
+        "case_id",
+        "attempt_id",
+        "angle_deg",
+        "g1c",
+        "original_path",
+        "size_bytes",
+        "sha256",
+        "job_name",
+        "deletion_policy",
+    ]
+    d_index = index_dir / f"{batch_id}_odb_deletion_index.csv"
+    with d_index.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=headers)
+        writer.writeheader()
+        writer.writerows(rows)
+    return {"d_index": d_index, "deleted_count": len(rows), "deleted_bytes": deleted_bytes}
+
+
 @app.command("calibrate-strength")
 def calibrate_strength_command(
     target_xlsx: Annotated[
@@ -2775,7 +3261,7 @@ def calibrate_strength_command(
         bool,
         typer.Option(
             "--execute",
-            help="Prepare, datacheck, run, record history, and archive ODBs.",
+            help="Prepare, datacheck, run, record history, and clean up ODBs.",
         ),
     ] = False,
     dry_run: Annotated[
@@ -2794,6 +3280,20 @@ def calibrate_strength_command(
     no_archive: Annotated[
         bool,
         typer.Option("--no-archive", help="Do not archive ODBs after executed batches."),
+    ] = False,
+    delete_odb: Annotated[
+        bool,
+        typer.Option(
+            "--delete-odb",
+            help="Delete ODBs after executed batches instead of archiving.",
+        ),
+    ] = False,
+    auto_next_candidates: Annotated[
+        bool,
+        typer.Option(
+            "--auto-next-candidates",
+            help="Automatically generate next candidates after an executed batch.",
+        ),
     ] = False,
     reference_angle_deg: Annotated[
         float,
@@ -2818,6 +3318,8 @@ def calibrate_strength_command(
         raise typer.BadParameter("--max-batches must be at least 1")
     if execute and params_json is None:
         raise typer.BadParameter("--params-json is required with --execute")
+    if no_archive and delete_odb:
+        raise typer.BadParameter("--no-archive and --delete-odb are mutually exclusive")
 
     output_root.mkdir(parents=True, exist_ok=True)
     history_csv = current_history_csv or (output_root / "calibration_history.csv")
@@ -2869,6 +3371,10 @@ def calibrate_strength_command(
                 "params_json": str(params_json) if params_json else None,
                 "execute": execute,
                 "dry_run": dry_run,
+                "auto_next_candidates": auto_next_candidates,
+                "odb_cleanup_policy": (
+                    "delete" if delete_odb else "keep" if no_archive or dry_run else "archive"
+                ),
                 "data_roles": {
                     "targets": TARGET_ONLY,
                     "reference_summaries": REFERENCE_SIM,
@@ -2900,7 +3406,7 @@ def calibrate_strength_command(
         last_plan = plan
         if not execute or not plan["candidates"]:
             break
-        archive_target = None if no_archive or dry_run else archive_root
+        archive_target = None if no_archive or dry_run or delete_odb else archive_root
         execution = run_calibration_batch(
             params_json=params_json or Path(),
             candidates=plan["candidates"],
@@ -2908,12 +3414,51 @@ def calibrate_strength_command(
             batch_id=this_batch_id,
             history_csv=history_csv,
             archive_root=archive_target,
+            delete_odb=delete_odb and not dry_run,
             dry_run=dry_run,
             force=force,
         )
         executed_batches += 1
         plan["execution"] = execution
         sim_records.extend(execution["history_rows"])
+        if not auto_next_candidates:
+            paused_plan = {
+                "created_at": _now(),
+                "pipeline_version": PIPELINE_VERSION,
+                "target_count": len(targets),
+                "active_target_count": sum(
+                    1
+                    for target in targets
+                    if target.get("data_role") == TARGET_ONLY
+                    and not target.get("excluded")
+                    and (
+                        not case_id
+                        or target.get("case_key") in {_case_key(item) for item in case_id}
+                    )
+                ),
+                "simulation_point_count": len(sim_records),
+                "batch_size": batch_size,
+                "candidate_count": 0,
+                "decisions": [],
+                "candidates": [],
+                "paused_before_candidate_generation": True,
+                "requires_codex_advisor_review": True,
+                "pause_reason": (
+                    "executed batch completed; next candidates must be generated only after "
+                    "explicit Codex advisor review of actual results and physical constraints"
+                ),
+                "last_execution": execution,
+            }
+            add_plan_metadata(
+                paused_plan,
+                this_batch_id=this_batch_id,
+                batch_index=batch_index,
+                plan_phase="post_execution_paused",
+                last_executed_batch_id=this_batch_id,
+            )
+            paths = write_calibration_outputs(output_root, paused_plan, targets, sim_records)
+            last_plan = paused_plan
+            break
         refreshed_plan = build_calibration_plan(
             targets,
             sim_records,
